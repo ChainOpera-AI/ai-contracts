@@ -1,2 +1,2 @@
 # checkin-contract
-Checkin contract on bsc &amp; opbnb
+ChainOpera contracts on bsc &amp; opbnb
