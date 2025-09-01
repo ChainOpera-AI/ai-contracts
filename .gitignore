@@ -1,0 +1,25 @@
+# Remix compiler artifacts
+**/artifacts/
+**/artifacts/**
+
+# Remix plugin state folders
+.DS_Store
+deps/
+.deps/
+states/
+.states/
+
+# Debug info
+*.dbg.json
+*.tsbuildinfo
+
+# Optional
+.env
+.env.local
+node_modules
+
+#java
+.class
+.lst
+scripts/merkle-proof/target/
+.vscode
