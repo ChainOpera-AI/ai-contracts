@@ -120,29 +120,15 @@ contract AgentMemberRecord is ReentrancyGuard {
     address private _recorder;
     bool private _switch;
 
-    //PROD START
     uint constant GRADE_1_AMOUNT = 9900000000;
-    uint constant GRADE_2_AMOUNT = 99900000000;
-    uint constant GRADE_3_AMOUNT = 499900000000;
-    uint constant GRADE_4_AMOUNT = 1499900000000;
+    uint constant GRADE_2_AMOUNT = 39900000000;
+    uint constant GRADE_3_AMOUNT = 199900000000;
+    uint constant GRADE_4_AMOUNT = 499900000000;
 
     uint constant GRADE_1_DURATION = 365 days;
     uint constant GRADE_2_DURATION = 365 days;
     uint constant GRADE_3_DURATION = 365 days;
     uint constant GRADE_4_DURATION = 365 days;
-    //PROD END
-
-    //DEBUG START
-    //uint constant GRADE_1_AMOUNT = 99;
-    //uint constant GRADE_2_AMOUNT = 999;
-    //uint constant GRADE_3_AMOUNT = 4999;
-    //uint constant GRADE_4_AMOUNT = 14999;
-
-    //uint constant GRADE_1_DURATION = 1 hours;
-    //uint constant GRADE_2_DURATION = 1 hours;
-    //uint constant GRADE_3_DURATION = 1 hours;
-    //uint constant GRADE_4_DURATION = 1 hours;
-    //DEBUG END
 
     uint constant GRADE_1_LIMIT = 10000;
     uint constant GRADE_2_LIMIT = 1000;
