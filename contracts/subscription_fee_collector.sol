@@ -33,6 +33,7 @@ contract Subscription is ReentrancyGuard {
         address caller
     );
     error ZeroAddress();
+    error InvalidReceiver();
 
     event SubscribedUSDT(
         address indexed account,
@@ -172,6 +173,7 @@ contract Subscription is ReentrancyGuard {
 
     constructor(address receiver, address feeCollector, uint minDelay, address[] memory proposers, address[] memory executors, address admin) {
         if (receiver == address(0) || feeCollector == address(0)) revert ZeroAddress();
+        if (receiver == address(this)) revert InvalidReceiver();
         _feeCollector = feeCollector;
         emit FeeCollectorChanged(feeCollector);
         _twapInterval = TWAP_INTERVAL;
@@ -218,7 +220,7 @@ contract Subscription is ReentrancyGuard {
         _renew(account);
     }
 
-    function cancelSubscription() external {
+    function cancelSubscription() switchOn external {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
@@ -400,6 +402,7 @@ contract Subscription is ReentrancyGuard {
 
     function setReceiver(address new_receiver) onlyOwner external {
         if (new_receiver == address(0)) revert ZeroAddress();
+        if (new_receiver == address(this)) revert InvalidReceiver();
         _receiver = new_receiver;
         emit ReceiverChanged(new_receiver);
     }
@@ -585,8 +588,14 @@ contract Subscription is ReentrancyGuard {
         secondsAgos[0] = _twapInterval;
         secondsAgos[1] = 0;
         try _coaiPriceFeed.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
-            int56 rawAvgTick = (tickCumulatives[1] - tickCumulatives[0]) / int56(uint56(_twapInterval));
-            return rawAvgTick >= int56(TickMath.MIN_TICK) && rawAvgTick <= int56(TickMath.MAX_TICK);
+            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
+            int56 rawAvgTick = tickDelta / int56(uint56(_twapInterval));
+            if (rawAvgTick < int56(TickMath.MIN_TICK) || rawAvgTick > int56(TickMath.MAX_TICK)) return false;
+            int24 avgTick = int24(rawAvgTick);
+            // Same floor correction as _getCoaiTwapSqrtPriceX96; without it the health check
+            // can return true while the price path reverts (avgTick falls below MIN_TICK).
+            if (tickDelta < 0 && (tickDelta % int56(uint56(_twapInterval)) != 0)) avgTick--;
+            return avgTick >= TickMath.MIN_TICK && avgTick <= TickMath.MAX_TICK;
         } catch {
             return false;
         }
