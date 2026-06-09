@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0
-pragma solidity >=0.8.0;
+pragma solidity ^0.8.20;
 
-import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/Address.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/governance/TimelockController.sol";
 import "./lib/IPancakeV3PoolState.sol";
 import "./lib/TickMath.sol";
 
 contract Subscription is ReentrancyGuard {
-    using Address for address payable;
     using SafeERC20 for ERC20;
     error TWAPNotAvailable();
     error SwitchOff();
-    error InvalidActionValues();
+    error InvalidTwapInterval();
     error UnsupportedDecimals();
     error CoaiNotInPool();
     error InvalidSubscriptionType(uint subscriptionType);
@@ -24,7 +21,6 @@ contract Subscription is ReentrancyGuard {
     error NotDueYet(uint nextChargeableAt);
     error NotSubscribed();
     error UnknownPeriod();
-    error CannotRenewBNB();
     error UnknownPayToken(uint8 payToken);
     error UnsettledDebt(uint nextChargeableAt);
     error NoDebt();
@@ -37,22 +33,7 @@ contract Subscription is ReentrancyGuard {
         address caller
     );
     error ZeroAddress();
-    error InvalidValue(
-        uint required,
-        uint actual
-    );
-    error InvalidPrice(
-        int price,
-        uint updatedAt
-    );
 
-    event Subscribed(
-        address indexed account,
-        uint indexed subscriptionType,
-        uint amount,
-        uint requiredBNBAmount,
-        uint remainingBNBAmount
-    );
     event SubscribedUSDT(
         address indexed account,
         uint indexed subscriptionType,
@@ -73,14 +54,10 @@ contract Subscription is ReentrancyGuard {
         address indexed new_coaiAddress,
         uint8 coaiDecimals
     );
-    event PriceFeedAddressChanged(
-        address indexed new_priceFeedAddress
-    );
     event COAIPriceFeedAddressChanged(
         address indexed new_coaiPriceFeedAddress
     );
-    event ActionValuesChanged(
-        uint64 new_feederHealthLimit,
+    event TwapIntervalChanged(
         uint32 new_twapInterval
     );
     event SwitchChanged(
@@ -143,14 +120,12 @@ contract Subscription is ReentrancyGuard {
     uint8 private _usdtDecimals;
     ERC20 private _coai;
     uint8 private _coaiDecimals;
-    AggregatorV3Interface private _priceFeed;
     IPancakeV3PoolState private _coaiPriceFeed;
     bool private _coaiIsToken0;
-    uint64 private _feederHealthLimit;
     uint32 private _twapInterval;
     address private _owner;
     address private _pendingOwner;
-    address payable private _receiver;
+    address private _receiver;
     bool private _switch;
     // subscriptionType => price in USD * 10^USD_DECIMALS (0 = inactive/undefined)
     mapping(uint => uint) private _subscriptionPrices;
@@ -163,7 +138,7 @@ contract Subscription is ReentrancyGuard {
     mapping(address => mapping(uint => uint)) private _nextChargeableAt;
     // user => currently active subscriptionType (0 = none). Only one active subscription per user.
     mapping(address => uint) private _activeType;
-    // user => payToken used at last subscribe (PAY_TOKEN_BNB / _USDT / _COAI). Determines renew currency.
+    // user => payToken used at last subscribe (PAY_TOKEN_USDT / _COAI). Determines renew currency.
     mapping(address => uint8) private _activePayToken;
 
     // subscriptionType id constants
@@ -180,7 +155,7 @@ contract Subscription is ReentrancyGuard {
     uint constant DEFAULT_DISCOUNT = 700; // 30% off
     uint32 constant PERIOD_MONTH = 30 days;
     uint32 constant PERIOD_YEAR = 365 days;
-    uint8 constant PAY_TOKEN_BNB = 0;
+    // PAY_TOKEN_USDT/COAI values are stable identifiers; 0 reserved for "unset/never subscribed".
     uint8 constant PAY_TOKEN_USDT = 1;
     uint8 constant PAY_TOKEN_COAI = 2;
 
@@ -188,11 +163,9 @@ contract Subscription is ReentrancyGuard {
     // rawAmount uses Chainlink-style fixed-point USD: USD * 1e8 (e.g. $19.99 -> 1_999_000_000)
     uint8 constant USD_DECIMALS = 8;
     // sqrt(10**18); used to downscale sqrtPriceX96 before squaring to avoid uint256 overflow.
-    // Tied to COAI/quote both having 18 decimals — enforced via _requireSupportedDecimals.
+    // Tied to COAI/quote both having 18 decimals — enforced in constructor and setCOAIAddress.
     uint constant SQRT_PRICE_SCALE = 1e9;
     uint32 constant TWAP_INTERVAL = 1800; // 30 minutes
-    uint64 constant DEFAULT_CHAINLINK_FEEDER_HEALTH_LIMIT = 1 days;
-    address constant DEFAULT_CHAINLINK_FEEDER = 0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE;
     address constant DEFAULT_PANCAKE_COAI_POOL = 0xbc0E5A205D729299D93973d634E2507CD8b625A3;
     address constant DEFAULT_USDT = 0x55d398326f99059fF775485246999027B3197955;
     address constant DEFAULT_COAI = 0x0A8D6C86e1bcE73fE4D0bD531e1a567306836EA5;
@@ -201,17 +174,15 @@ contract Subscription is ReentrancyGuard {
         if (receiver == address(0) || feeCollector == address(0)) revert ZeroAddress();
         _feeCollector = feeCollector;
         emit FeeCollectorChanged(feeCollector);
-        _feederHealthLimit = DEFAULT_CHAINLINK_FEEDER_HEALTH_LIMIT;
         _twapInterval = TWAP_INTERVAL;
         _usdt = ERC20(DEFAULT_USDT);
         _usdtDecimals = ERC20(DEFAULT_USDT).decimals();
         _coai = ERC20(DEFAULT_COAI);
         _coaiDecimals = ERC20(DEFAULT_COAI).decimals();
         if (_coaiDecimals != 18) revert UnsupportedDecimals();
-        _priceFeed = AggregatorV3Interface(DEFAULT_CHAINLINK_FEEDER);
         _coaiPriceFeed = IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL);
         _coaiIsToken0 = _resolveCoaiIsToken0(IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL), DEFAULT_COAI);
-        _receiver = payable(receiver);
+        _receiver = receiver;
         TimelockController timelock = new TimelockController(minDelay, proposers, executors, admin);
         _owner = address(timelock);
         _switch = true;
@@ -233,10 +204,6 @@ contract Subscription is ReentrancyGuard {
         emit SubscriptionPeriodChanged(SUB_TYPE_PRO_MONTH,  PERIOD_MONTH);
         emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_YEAR,  PERIOD_YEAR);
         emit SubscriptionPeriodChanged(SUB_TYPE_PRO_YEAR,   PERIOD_YEAR);
-    }
-
-    function subscription(uint subscriptionType) switchOn payable external nonReentrant {
-        _subscription(subscriptionType);
     }
 
     function subscriptionUSDT(uint subscriptionType) switchOn external nonReentrant {
@@ -262,7 +229,7 @@ contract Subscription is ReentrancyGuard {
         emit SubscriptionCancelled(sender, subscriptionType, block.timestamp);
     }
 
-    function settleDebt() switchOn external payable nonReentrant {
+    function settleDebt() switchOn external nonReentrant {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
@@ -276,15 +243,7 @@ contract Subscription is ReentrancyGuard {
         uint price = _priceOf(subscriptionType);
         uint8 payToken = _activePayToken[sender];
         uint requiredTokenAmount;
-        if (payToken == PAY_TOKEN_BNB) {
-            requiredTokenAmount = _calculateAmount(price) * periodsCharged;
-            uint value = msg.value;
-            if (value < requiredTokenAmount) revert InvalidValue(requiredTokenAmount, value);
-            uint remaining = value - requiredTokenAmount;
-            emit DebtSettled(sender, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
-            _receiver.sendValue(requiredTokenAmount);
-            if (remaining > 0) payable(sender).sendValue(remaining);
-        } else if (payToken == PAY_TOKEN_USDT) {
+        if (payToken == PAY_TOKEN_USDT) {
             requiredTokenAmount = _calculateAmountUSDT(price) * periodsCharged;
             emit DebtSettled(sender, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
             _usdt.safeTransferFrom(sender, _receiver, requiredTokenAmount);
@@ -334,10 +293,6 @@ contract Subscription is ReentrancyGuard {
         return _nextChargeableAt[account][subscriptionType];
     }
 
-    function getSubscriptionAmount(uint subscriptionType) external view returns (uint) {
-        return _calculateAmount(_priceOf(subscriptionType));
-    }
-
     function getSubscriptionAmountUSDT(uint subscriptionType) external view returns (uint) {
         return _calculateAmountUSDT(_priceOf(subscriptionType));
     }
@@ -365,10 +320,8 @@ contract Subscription is ReentrancyGuard {
         emit DiscountChanged(new_discount);
     }
 
-    function getPriceFeedHealth() external view returns (bool chainlinkHealthy, bool coaiTwapHealthy) {
-        (uint80 roundId, int price, , uint updatedAt, uint80 answeredInRound) = _priceFeed.latestRoundData();
-        chainlinkHealthy = _isPriceFeedHealthy(price, updatedAt, roundId, answeredInRound);
-        coaiTwapHealthy = _isCoaiTwapHealthy();
+    function getCoaiTwapHealth() external view returns (bool) {
+        return _isCoaiTwapHealthy();
     }
 
     function getUSDTAddress() external view returns (address) {
@@ -411,16 +364,6 @@ contract Subscription is ReentrancyGuard {
         emit COAIPriceFeedAddressChanged(new_coaiPriceFeedAddress);
     }
 
-    function getPriceFeedAddress() external view returns (address) {
-        return address(_priceFeed);
-    }
-
-    function setPriceFeedAddress(address new_priceFeedAddress) onlyOwner external {
-        if (new_priceFeedAddress == address(0)) revert ZeroAddress();
-        _priceFeed = AggregatorV3Interface(new_priceFeedAddress);
-        emit PriceFeedAddressChanged(new_priceFeedAddress);
-    }
-
     function getCOAIPriceFeedAddress() external view returns (address) {
         return address(_coaiPriceFeed);
     }
@@ -432,16 +375,14 @@ contract Subscription is ReentrancyGuard {
         emit COAIPriceFeedAddressChanged(new_coaiPriceFeedAddress);
     }
 
-    function getActionValues() external view returns (uint64 feederHealthLimit, uint32 twapInterval) {
-        return (_feederHealthLimit, _twapInterval);
+    function getTwapInterval() external view returns (uint32) {
+        return _twapInterval;
     }
 
-    function setActionValues(uint64 new_feederHealthLimit, uint32 new_twapInterval) onlyOwner external {
-        if (new_feederHealthLimit == 0 || new_feederHealthLimit > 7 days) revert InvalidActionValues();
-        if (new_twapInterval < 300 || new_twapInterval > 1 days) revert InvalidActionValues();
-        _feederHealthLimit = new_feederHealthLimit;
+    function setTwapInterval(uint32 new_twapInterval) onlyOwner external {
+        if (new_twapInterval < 300 || new_twapInterval > 1 days) revert InvalidTwapInterval();
         _twapInterval = new_twapInterval;
-        emit ActionValuesChanged(new_feederHealthLimit, new_twapInterval);
+        emit TwapIntervalChanged(new_twapInterval);
     }
 
     function getSwitch() external view returns (bool) {
@@ -459,7 +400,7 @@ contract Subscription is ReentrancyGuard {
 
     function setReceiver(address new_receiver) onlyOwner external {
         if (new_receiver == address(0)) revert ZeroAddress();
-        _receiver = payable(new_receiver);
+        _receiver = new_receiver;
         emit ReceiverChanged(new_receiver);
     }
 
@@ -506,20 +447,6 @@ contract Subscription is ReentrancyGuard {
         _;
     }
 
-    function _subscription(uint subscriptionType) private {
-        address sender = msg.sender;
-        _requireDue(sender, subscriptionType);
-        uint price = _priceOf(subscriptionType);
-        uint requiredBNBAmount = _calculateAmount(price);
-        uint value = msg.value;
-        if (value < requiredBNBAmount) revert InvalidValue(requiredBNBAmount, value);
-        uint remainingBNBAmount = value - requiredBNBAmount;
-        _activate(sender, subscriptionType, PAY_TOKEN_BNB);
-        emit Subscribed(sender, subscriptionType, price, requiredBNBAmount, remainingBNBAmount);
-        _receiver.sendValue(requiredBNBAmount);
-        if (remainingBNBAmount > 0) payable(sender).sendValue(remainingBNBAmount);
-    }
-
     function _subscriptionUSDT(uint subscriptionType) private {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
@@ -549,7 +476,6 @@ contract Subscription is ReentrancyGuard {
         if (period == 0) revert UnknownPeriod();
         if (block.timestamp < next) revert NotDueYet(next);
         uint8 payToken = _activePayToken[account];
-        if (payToken == PAY_TOKEN_BNB) revert CannotRenewBNB();
         // anchor-based accumulation: charge for every period elapsed since the anchor
         uint periodsCharged = (block.timestamp - next) / period + 1;
         _nextChargeableAt[account][subscriptionType] = next + periodsCharged * period;
@@ -596,15 +522,6 @@ contract Subscription is ReentrancyGuard {
         // First subscribe (or post-cancel/switch fresh start): anchor at now + period.
         // Existing anchor (same-type resubscribe before fee collector renews): advance by one period.
         _nextChargeableAt[account][subscriptionType] = next == 0 ? block.timestamp + period : next + period;
-    }
-
-    function _calculateAmount(uint rawAmount) private view returns (uint) {
-        (uint80 roundId, int price, , uint updatedAt, uint80 answeredInRound) = _priceFeed.latestRoundData();
-        if (!_isPriceFeedHealthy(price, updatedAt, roundId, answeredInRound)) revert InvalidPrice(price, updatedAt);
-        uint8 feedDecimals = _priceFeed.decimals();
-        // rawAmount(USD * 10^USD_DECIMALS) -> BNB wei (18 decimals); price is in USD per BNB at 10^feedDecimals
-        // bnbAmount = rawAmount * 10^(18 - USD_DECIMALS + feedDecimals) / price
-        return rawAmount * 10 ** (18 - USD_DECIMALS + feedDecimals) / uint(price);
     }
 
     function _calculateAmountUSDT(uint rawAmount) private view returns (uint) {
@@ -661,12 +578,6 @@ contract Subscription is ReentrancyGuard {
         } catch {
             revert TWAPNotAvailable();
         }
-    }
-
-    function _isPriceFeedHealthy(int price, uint updatedAt, uint80 roundId, uint80 answeredInRound) private view returns (bool) {
-        return price > 0
-            && updatedAt >= block.timestamp - _feederHealthLimit
-            && answeredInRound >= roundId;
     }
 
     function _isCoaiTwapHealthy() private view returns (bool) {
