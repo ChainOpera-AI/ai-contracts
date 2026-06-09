@@ -34,6 +34,7 @@ contract Subscription is ReentrancyGuard {
     );
     error ZeroAddress();
     error InvalidReceiver();
+    error InvalidTimelockConfig();
 
     event SubscribedUSDT(
         address indexed account,
@@ -47,6 +48,12 @@ contract Subscription is ReentrancyGuard {
         uint amount,
         uint requiredCOAIAmount
     );
+    event SubscribedUSDC(
+        address indexed account,
+        uint indexed subscriptionType,
+        uint amount,
+        uint requiredUSDCAmount
+    );
     event USDTAddressChanged(
         address indexed new_usdtAddress,
         uint8 usdtDecimals
@@ -54,6 +61,10 @@ contract Subscription is ReentrancyGuard {
     event COAIAddressChanged(
         address indexed new_coaiAddress,
         uint8 coaiDecimals
+    );
+    event USDCAddressChanged(
+        address indexed new_usdcAddress,
+        uint8 usdcDecimals
     );
     event COAIPriceFeedAddressChanged(
         address indexed new_coaiPriceFeedAddress
@@ -79,6 +90,7 @@ contract Subscription is ReentrancyGuard {
         uint new_price
     );
     event DiscountChanged(
+        uint8 indexed payToken,
         uint new_discount
     );
     event FeeCollectorChanged(
@@ -110,7 +122,7 @@ contract Subscription is ReentrancyGuard {
     event Renewed(
         address indexed account,
         uint indexed subscriptionType,
-        uint8 indexed payToken, // 1 = USDT, 2 = COAI
+        uint8 indexed payToken, // 1 = USDT, 2 = COAI, 3 = USDC
         uint price,
         uint requiredTokenAmount,
         uint periodsCharged,
@@ -121,6 +133,8 @@ contract Subscription is ReentrancyGuard {
     uint8 private _usdtDecimals;
     ERC20 private _coai;
     uint8 private _coaiDecimals;
+    ERC20 private _usdc;
+    uint8 private _usdcDecimals;
     IPancakeV3PoolState private _coaiPriceFeed;
     bool private _coaiIsToken0;
     uint32 private _twapInterval;
@@ -130,8 +144,8 @@ contract Subscription is ReentrancyGuard {
     bool private _switch;
     // subscriptionType => price in USD * 10^USD_DECIMALS (0 = inactive/undefined)
     mapping(uint => uint) private _subscriptionPrices;
-    // discount numerator, denominator = DISCOUNT_BASE. e.g. 700 / 1000 = 30% off
-    uint private _discount;
+    // payToken => discount numerator, denominator = DISCOUNT_BASE. e.g. 700 / 1000 = 30% off
+    mapping(uint8 => uint) private _discounts;
     address private _feeCollector;
     // subscriptionType => recurring period in seconds (0 = non-recurring/undefined)
     mapping(uint => uint32) private _subscriptionPeriods;
@@ -139,7 +153,7 @@ contract Subscription is ReentrancyGuard {
     mapping(address => mapping(uint => uint)) private _nextChargeableAt;
     // user => currently active subscriptionType (0 = none). Only one active subscription per user.
     mapping(address => uint) private _activeType;
-    // user => payToken used at last subscribe (PAY_TOKEN_USDT / _COAI). Determines renew currency.
+    // user => payToken used at last subscribe (PAY_TOKEN_USDT / _COAI / _USDC). Determines renew currency.
     mapping(address => uint8) private _activePayToken;
 
     // subscriptionType id constants
@@ -153,12 +167,13 @@ contract Subscription is ReentrancyGuard {
     uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR  = 19188000000;
     uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR   = 191988000000;
     uint constant DISCOUNT_BASE = 1000;
-    uint constant DEFAULT_DISCOUNT = 700; // 30% off
+    uint constant DEFAULT_DISCOUNT_COAI = 700; // 30% off, applied only to COAI payments by default
     uint32 constant PERIOD_MONTH = 30 days;
     uint32 constant PERIOD_YEAR = 365 days;
-    // PAY_TOKEN_USDT/COAI values are stable identifiers; 0 reserved for "unset/never subscribed".
+    // PAY_TOKEN_USDT/COAI/USDC values are stable identifiers; 0 reserved for "unset/never subscribed".
     uint8 constant PAY_TOKEN_USDT = 1;
     uint8 constant PAY_TOKEN_COAI = 2;
+    uint8 constant PAY_TOKEN_USDC = 3;
 
     uint constant RATE = 2**96;
     // rawAmount uses Chainlink-style fixed-point USD: USD * 1e8 (e.g. $19.99 -> 1_999_000_000)
@@ -170,10 +185,14 @@ contract Subscription is ReentrancyGuard {
     address constant DEFAULT_PANCAKE_COAI_POOL = 0xbc0E5A205D729299D93973d634E2507CD8b625A3;
     address constant DEFAULT_USDT = 0x55d398326f99059fF775485246999027B3197955;
     address constant DEFAULT_COAI = 0x0A8D6C86e1bcE73fE4D0bD531e1a567306836EA5;
+    address constant DEFAULT_USDC = 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d;
 
     constructor(address receiver, address feeCollector, uint minDelay, address[] memory proposers, address[] memory executors, address admin) {
         if (receiver == address(0) || feeCollector == address(0)) revert ZeroAddress();
         if (receiver == address(this)) revert InvalidReceiver();
+        // admin holds TIMELOCK_ADMIN_ROLE and can grant/revoke proposer/executor roles
+        // without the delay, defeating the timelock — must be zero, the timelock self-administers.
+        if (admin != address(0)) revert InvalidTimelockConfig();
         _feeCollector = feeCollector;
         emit FeeCollectorChanged(feeCollector);
         _twapInterval = TWAP_INTERVAL;
@@ -182,6 +201,8 @@ contract Subscription is ReentrancyGuard {
         _coai = ERC20(DEFAULT_COAI);
         _coaiDecimals = ERC20(DEFAULT_COAI).decimals();
         if (_coaiDecimals != 18) revert UnsupportedDecimals();
+        _usdc = ERC20(DEFAULT_USDC);
+        _usdcDecimals = ERC20(DEFAULT_USDC).decimals();
         _coaiPriceFeed = IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL);
         _coaiIsToken0 = _resolveCoaiIsToken0(IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL), DEFAULT_COAI);
         _receiver = receiver;
@@ -196,8 +217,12 @@ contract Subscription is ReentrancyGuard {
         emit SubscriptionPriceChanged(SUB_TYPE_PRO_MONTH,  DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH);
         emit SubscriptionPriceChanged(SUB_TYPE_PLUS_YEAR,  DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR);
         emit SubscriptionPriceChanged(SUB_TYPE_PRO_YEAR,   DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR);
-        _discount = DEFAULT_DISCOUNT;
-        emit DiscountChanged(DEFAULT_DISCOUNT);
+        _discounts[PAY_TOKEN_USDT] = DISCOUNT_BASE; // no discount for USDT
+        _discounts[PAY_TOKEN_COAI] = DEFAULT_DISCOUNT_COAI;
+        _discounts[PAY_TOKEN_USDC] = DISCOUNT_BASE; // no discount for USDC
+        emit DiscountChanged(PAY_TOKEN_USDT, DISCOUNT_BASE);
+        emit DiscountChanged(PAY_TOKEN_COAI, DEFAULT_DISCOUNT_COAI);
+        emit DiscountChanged(PAY_TOKEN_USDC, DISCOUNT_BASE);
         _subscriptionPeriods[SUB_TYPE_PLUS_MONTH] = PERIOD_MONTH;
         _subscriptionPeriods[SUB_TYPE_PRO_MONTH]  = PERIOD_MONTH;
         _subscriptionPeriods[SUB_TYPE_PLUS_YEAR]  = PERIOD_YEAR;
@@ -216,11 +241,15 @@ contract Subscription is ReentrancyGuard {
         _subscriptionCOAI(subscriptionType);
     }
 
-    function renew(address account) switchOn onlyFeeCollector external nonReentrant {
+    function subscriptionUSDC(uint subscriptionType) switchOn external nonReentrant {
+        _subscriptionUSDC(subscriptionType);
+    }
+
+    function renew(address account) onlyFeeCollector external nonReentrant {
         _renew(account);
     }
 
-    function cancelSubscription() switchOn external {
+    function cancelSubscription() external {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
@@ -231,7 +260,7 @@ contract Subscription is ReentrancyGuard {
         emit SubscriptionCancelled(sender, subscriptionType, block.timestamp);
     }
 
-    function settleDebt() switchOn external nonReentrant {
+    function settleDebt() external nonReentrant {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
@@ -242,8 +271,8 @@ contract Subscription is ReentrancyGuard {
         if (block.timestamp < next) revert NoDebt();
         uint periodsCharged = (block.timestamp - next) / period + 1;
         _nextChargeableAt[sender][subscriptionType] = next + periodsCharged * period;
-        uint price = _priceOf(subscriptionType);
         uint8 payToken = _activePayToken[sender];
+        uint price = _priceOf(subscriptionType, payToken);
         uint requiredTokenAmount;
         if (payToken == PAY_TOKEN_USDT) {
             requiredTokenAmount = _calculateAmountUSDT(price) * periodsCharged;
@@ -253,6 +282,10 @@ contract Subscription is ReentrancyGuard {
             requiredTokenAmount = _calculateAmountCOAI(price) * periodsCharged;
             emit DebtSettled(sender, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
             _coai.safeTransferFrom(sender, _receiver, requiredTokenAmount);
+        } else if (payToken == PAY_TOKEN_USDC) {
+            requiredTokenAmount = _calculateAmountUSDC(price) * periodsCharged;
+            emit DebtSettled(sender, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
+            _usdc.safeTransferFrom(sender, _receiver, requiredTokenAmount);
         } else {
             revert UnknownPayToken(payToken);
         }
@@ -273,6 +306,9 @@ contract Subscription is ReentrancyGuard {
     }
 
     function setSubscriptionPeriod(uint subscriptionType, uint32 periodSeconds) onlyOwner external {
+        // type 0 is the "unset / never subscribed" sentinel in _activeType;
+        // allowing it here would let users pay while _activeType stays 0, locking them out.
+        if (subscriptionType == 0) revert InvalidSubscriptionType(0);
         _subscriptionPeriods[subscriptionType] = periodSeconds;
         emit SubscriptionPeriodChanged(subscriptionType, periodSeconds);
     }
@@ -296,11 +332,15 @@ contract Subscription is ReentrancyGuard {
     }
 
     function getSubscriptionAmountUSDT(uint subscriptionType) external view returns (uint) {
-        return _calculateAmountUSDT(_priceOf(subscriptionType));
+        return _calculateAmountUSDT(_priceOf(subscriptionType, PAY_TOKEN_USDT));
     }
 
     function getSubscriptionAmountCOAI(uint subscriptionType) external view returns (uint) {
-        return _calculateAmountCOAI(_priceOf(subscriptionType));
+        return _calculateAmountCOAI(_priceOf(subscriptionType, PAY_TOKEN_COAI));
+    }
+
+    function getSubscriptionAmountUSDC(uint subscriptionType) external view returns (uint) {
+        return _calculateAmountUSDC(_priceOf(subscriptionType, PAY_TOKEN_USDC));
     }
 
     function getSubscriptionPrice(uint subscriptionType) external view returns (uint) {
@@ -308,18 +348,22 @@ contract Subscription is ReentrancyGuard {
     }
 
     function setSubscriptionPrice(uint subscriptionType, uint price) onlyOwner external {
+        if (subscriptionType == 0) revert InvalidSubscriptionType(0);
         _subscriptionPrices[subscriptionType] = price;
         emit SubscriptionPriceChanged(subscriptionType, price);
     }
 
-    function getDiscount() external view returns (uint) {
-        return _discount;
+    function getDiscount(uint8 payToken) external view returns (uint) {
+        return _discounts[payToken];
     }
 
-    function setDiscount(uint new_discount) onlyOwner external {
+    function setDiscount(uint8 payToken, uint new_discount) onlyOwner external {
+        if (payToken != PAY_TOKEN_USDT && payToken != PAY_TOKEN_COAI && payToken != PAY_TOKEN_USDC) {
+            revert UnknownPayToken(payToken);
+        }
         if (new_discount == 0 || new_discount > DISCOUNT_BASE) revert InvalidDiscount();
-        _discount = new_discount;
-        emit DiscountChanged(new_discount);
+        _discounts[payToken] = new_discount;
+        emit DiscountChanged(payToken, new_discount);
     }
 
     function getCoaiTwapHealth() external view returns (bool) {
@@ -339,6 +383,21 @@ contract Subscription is ReentrancyGuard {
         _usdt = ERC20(new_usdtAddress);
         _usdtDecimals = ERC20(new_usdtAddress).decimals();
         emit USDTAddressChanged(new_usdtAddress, _usdtDecimals);
+    }
+
+    function getUSDCAddress() external view returns (address) {
+        return address(_usdc);
+    }
+
+    function getUSDCDecimals() external view returns (uint8) {
+        return _usdcDecimals;
+    }
+
+    function setUSDCAddress(address new_usdcAddress) onlyOwner external {
+        if (new_usdcAddress == address(0)) revert ZeroAddress();
+        _usdc = ERC20(new_usdcAddress);
+        _usdcDecimals = ERC20(new_usdcAddress).decimals();
+        emit USDCAddressChanged(new_usdcAddress, _usdcDecimals);
     }
 
     function getCOAIAddress() external view returns (address) {
@@ -453,7 +512,7 @@ contract Subscription is ReentrancyGuard {
     function _subscriptionUSDT(uint subscriptionType) private {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
-        uint price = _priceOf(subscriptionType);
+        uint price = _priceOf(subscriptionType, PAY_TOKEN_USDT);
         uint requiredUSDTAmount = _calculateAmountUSDT(price);
         _activate(sender, subscriptionType, PAY_TOKEN_USDT);
         emit SubscribedUSDT(sender, subscriptionType, price, requiredUSDTAmount);
@@ -463,11 +522,21 @@ contract Subscription is ReentrancyGuard {
     function _subscriptionCOAI(uint subscriptionType) private {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
-        uint price = _priceOf(subscriptionType);
+        uint price = _priceOf(subscriptionType, PAY_TOKEN_COAI);
         uint requiredCOAIAmount = _calculateAmountCOAI(price);
         _activate(sender, subscriptionType, PAY_TOKEN_COAI);
         emit SubscribedCOAI(sender, subscriptionType, price, requiredCOAIAmount);
         _coai.safeTransferFrom(sender, _receiver, requiredCOAIAmount);
+    }
+
+    function _subscriptionUSDC(uint subscriptionType) private {
+        address sender = msg.sender;
+        _requireDue(sender, subscriptionType);
+        uint price = _priceOf(subscriptionType, PAY_TOKEN_USDC);
+        uint requiredUSDCAmount = _calculateAmountUSDC(price);
+        _activate(sender, subscriptionType, PAY_TOKEN_USDC);
+        emit SubscribedUSDC(sender, subscriptionType, price, requiredUSDCAmount);
+        _usdc.safeTransferFrom(sender, _receiver, requiredUSDCAmount);
     }
 
     function _renew(address account) private {
@@ -482,7 +551,7 @@ contract Subscription is ReentrancyGuard {
         // anchor-based accumulation: charge for every period elapsed since the anchor
         uint periodsCharged = (block.timestamp - next) / period + 1;
         _nextChargeableAt[account][subscriptionType] = next + periodsCharged * period;
-        uint price = _priceOf(subscriptionType);
+        uint price = _priceOf(subscriptionType, payToken);
         uint requiredTokenAmount;
         if (payToken == PAY_TOKEN_USDT) {
             requiredTokenAmount = _calculateAmountUSDT(price) * periodsCharged;
@@ -492,6 +561,10 @@ contract Subscription is ReentrancyGuard {
             requiredTokenAmount = _calculateAmountCOAI(price) * periodsCharged;
             emit Renewed(account, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
             _coai.safeTransferFrom(account, _receiver, requiredTokenAmount);
+        } else if (payToken == PAY_TOKEN_USDC) {
+            requiredTokenAmount = _calculateAmountUSDC(price) * periodsCharged;
+            emit Renewed(account, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
+            _usdc.safeTransferFrom(account, _receiver, requiredTokenAmount);
         } else {
             revert UnknownPayToken(payToken);
         }
@@ -528,8 +601,13 @@ contract Subscription is ReentrancyGuard {
     }
 
     function _calculateAmountUSDT(uint rawAmount) private view returns (uint) {
-        // rawAmount in USD * 10^USD_DECIMALS -> token amount in USDT wei
+        // rawAmount in USD * 10^USD_DECIMALS -> token amount in USDT wei (USDT pegged 1:1 to USD)
         return rawAmount * (10 ** _usdtDecimals) / (10 ** USD_DECIMALS);
+    }
+
+    function _calculateAmountUSDC(uint rawAmount) private view returns (uint) {
+        // rawAmount in USD * 10^USD_DECIMALS -> token amount in USDC wei (USDC pegged 1:1 to USD)
+        return rawAmount * (10 ** _usdcDecimals) / (10 ** USD_DECIMALS);
     }
 
     function _calculateAmountCOAI(uint rawAmount) private view returns (uint) {
@@ -551,10 +629,10 @@ contract Subscription is ReentrancyGuard {
         }
     }
 
-    function _priceOf(uint subscriptionType) private view returns (uint) {
+    function _priceOf(uint subscriptionType, uint8 payToken) private view returns (uint) {
         uint price = _subscriptionPrices[subscriptionType];
         if (price == 0) revert InvalidSubscriptionType(subscriptionType);
-        return price * _discount / DISCOUNT_BASE;
+        return price * _discounts[payToken] / DISCOUNT_BASE;
     }
 
     function _resolveCoaiIsToken0(IPancakeV3PoolState pool, address coai) private view returns (bool) {
@@ -572,11 +650,14 @@ contract Subscription is ReentrancyGuard {
             int56[] memory tickCumulatives,
             uint160[] memory
         ) {
-            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
-            int56 rawAvgTick = tickDelta / int56(uint56(_twapInterval));
-            if (rawAvgTick < int56(TickMath.MIN_TICK) || rawAvgTick > int56(TickMath.MAX_TICK)) revert TWAPNotAvailable();
+            // Promote to int256 before subtracting so the diff cannot overflow int56 as
+            // pool cumulatives drift toward their bounds over years of accumulation.
+            int256 tickDelta = int256(tickCumulatives[1]) - int256(tickCumulatives[0]);
+            int256 interval = int256(uint256(_twapInterval));
+            int256 rawAvgTick = tickDelta / interval;
+            if (rawAvgTick < int256(TickMath.MIN_TICK) || rawAvgTick > int256(TickMath.MAX_TICK)) revert TWAPNotAvailable();
             int24 avgTick = int24(rawAvgTick);
-            if (tickDelta < 0 && (tickDelta % int56(uint56(_twapInterval)) != 0)) avgTick--;
+            if (tickDelta < 0 && (tickDelta % interval != 0)) avgTick--;
             return TickMath.getSqrtRatioAtTick(avgTick);
         } catch {
             revert TWAPNotAvailable();
@@ -588,13 +669,14 @@ contract Subscription is ReentrancyGuard {
         secondsAgos[0] = _twapInterval;
         secondsAgos[1] = 0;
         try _coaiPriceFeed.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
-            int56 tickDelta = tickCumulatives[1] - tickCumulatives[0];
-            int56 rawAvgTick = tickDelta / int56(uint56(_twapInterval));
-            if (rawAvgTick < int56(TickMath.MIN_TICK) || rawAvgTick > int56(TickMath.MAX_TICK)) return false;
+            int256 tickDelta = int256(tickCumulatives[1]) - int256(tickCumulatives[0]);
+            int256 interval = int256(uint256(_twapInterval));
+            int256 rawAvgTick = tickDelta / interval;
+            if (rawAvgTick < int256(TickMath.MIN_TICK) || rawAvgTick > int256(TickMath.MAX_TICK)) return false;
             int24 avgTick = int24(rawAvgTick);
             // Same floor correction as _getCoaiTwapSqrtPriceX96; without it the health check
             // can return true while the price path reverts (avgTick falls below MIN_TICK).
-            if (tickDelta < 0 && (tickDelta % int56(uint56(_twapInterval)) != 0)) avgTick--;
+            if (tickDelta < 0 && (tickDelta % interval != 0)) avgTick--;
             return avgTick >= TickMath.MIN_TICK && avgTick <= TickMath.MAX_TICK;
         } catch {
             return false;
