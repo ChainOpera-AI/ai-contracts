@@ -22,7 +22,6 @@ contract Subscription is ReentrancyGuard {
     error NotSubscribed();
     error UnknownPeriod();
     error UnknownPayToken(uint8 payToken);
-    error UnsettledDebt(uint nextChargeableAt);
     error NoDebt();
     error NotOwner(
         address owner,
@@ -35,6 +34,8 @@ contract Subscription is ReentrancyGuard {
     error ZeroAddress();
     error InvalidReceiver();
     error InvalidTimelockConfig();
+    error NotListed(uint subscriptionType);
+    error AlreadyListed(uint subscriptionType);
 
     event SubscribedUSDT(
         address indexed account,
@@ -100,6 +101,12 @@ contract Subscription is ReentrancyGuard {
         uint indexed subscriptionType,
         uint32 new_periodSeconds
     );
+    event SubscriptionListed(
+        uint indexed subscriptionType
+    );
+    event SubscriptionDelisted(
+        uint indexed subscriptionType
+    );
     event SubscriptionSwitched(
         address indexed account,
         uint indexed previous_subscriptionType,
@@ -149,6 +156,9 @@ contract Subscription is ReentrancyGuard {
     address private _feeCollector;
     // subscriptionType => recurring period in seconds (0 = non-recurring/undefined)
     mapping(uint => uint32) private _subscriptionPeriods;
+    // subscriptionType => listed (true => accepting new subscriptions). Delisting only blocks new
+    // subscribeXXX entries; existing subscribers can still renew, settle, and cancel.
+    mapping(uint => bool) private _subscriptionListed;
     // user => subscriptionType => next chargeable timestamp (0 = never subscribed; advanced by period on each charge, anchored to initial subscribe)
     mapping(address => mapping(uint => uint)) private _nextChargeableAt;
     // user => currently active subscriptionType (0 = none). Only one active subscription per user.
@@ -193,6 +203,9 @@ contract Subscription is ReentrancyGuard {
         // admin holds TIMELOCK_ADMIN_ROLE and can grant/revoke proposer/executor roles
         // without the delay, defeating the timelock — must be zero, the timelock self-administers.
         if (admin != address(0)) revert InvalidTimelockConfig();
+        // Empty proposers/executors would deadlock the timelock and leave the contract
+        // unable to ever execute onlyOwner mutations.
+        if (proposers.length == 0 || executors.length == 0) revert InvalidTimelockConfig();
         _feeCollector = feeCollector;
         emit FeeCollectorChanged(feeCollector);
         _twapInterval = TWAP_INTERVAL;
@@ -208,6 +221,7 @@ contract Subscription is ReentrancyGuard {
         _receiver = receiver;
         TimelockController timelock = new TimelockController(minDelay, proposers, executors, admin);
         _owner = address(timelock);
+        emit OwnerChanged(address(0), _owner);
         _switch = true;
         _subscriptionPrices[SUB_TYPE_PLUS_MONTH] = DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH;
         _subscriptionPrices[SUB_TYPE_PRO_MONTH]  = DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH;
@@ -231,6 +245,14 @@ contract Subscription is ReentrancyGuard {
         emit SubscriptionPeriodChanged(SUB_TYPE_PRO_MONTH,  PERIOD_MONTH);
         emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_YEAR,  PERIOD_YEAR);
         emit SubscriptionPeriodChanged(SUB_TYPE_PRO_YEAR,   PERIOD_YEAR);
+        _subscriptionListed[SUB_TYPE_PLUS_MONTH] = true;
+        _subscriptionListed[SUB_TYPE_PRO_MONTH]  = true;
+        _subscriptionListed[SUB_TYPE_PLUS_YEAR]  = true;
+        _subscriptionListed[SUB_TYPE_PRO_YEAR]   = true;
+        emit SubscriptionListed(SUB_TYPE_PLUS_MONTH);
+        emit SubscriptionListed(SUB_TYPE_PRO_MONTH);
+        emit SubscriptionListed(SUB_TYPE_PLUS_YEAR);
+        emit SubscriptionListed(SUB_TYPE_PRO_YEAR);
     }
 
     function subscriptionUSDT(uint subscriptionType) switchOn external nonReentrant {
@@ -249,11 +271,13 @@ contract Subscription is ReentrancyGuard {
         _renew(account);
     }
 
-    function cancelSubscription() external {
+    function cancelSubscription() external nonReentrant {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
-        _requireSettled(sender, subscriptionType);
+        // If the caller is in debt, auto-settle so users always exit fully paid up
+        // without needing a separate settleDebt tx first.
+        _settleIfDebt(sender, subscriptionType);
         delete _nextChargeableAt[sender][subscriptionType];
         delete _activeType[sender];
         delete _activePayToken[sender];
@@ -266,29 +290,8 @@ contract Subscription is ReentrancyGuard {
         if (subscriptionType == 0) revert NotSubscribed();
         uint next = _nextChargeableAt[sender][subscriptionType];
         if (next == 0) revert NotSubscribed();
-        uint32 period = _subscriptionPeriods[subscriptionType];
-        if (period == 0) revert UnknownPeriod();
         if (block.timestamp < next) revert NoDebt();
-        uint periodsCharged = (block.timestamp - next) / period + 1;
-        _nextChargeableAt[sender][subscriptionType] = next + periodsCharged * period;
-        uint8 payToken = _activePayToken[sender];
-        uint price = _priceOf(subscriptionType, payToken);
-        uint requiredTokenAmount;
-        if (payToken == PAY_TOKEN_USDT) {
-            requiredTokenAmount = _calculateAmountUSDT(price) * periodsCharged;
-            emit DebtSettled(sender, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
-            _usdt.safeTransferFrom(sender, _receiver, requiredTokenAmount);
-        } else if (payToken == PAY_TOKEN_COAI) {
-            requiredTokenAmount = _calculateAmountCOAI(price) * periodsCharged;
-            emit DebtSettled(sender, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
-            _coai.safeTransferFrom(sender, _receiver, requiredTokenAmount);
-        } else if (payToken == PAY_TOKEN_USDC) {
-            requiredTokenAmount = _calculateAmountUSDC(price) * periodsCharged;
-            emit DebtSettled(sender, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
-            _usdc.safeTransferFrom(sender, _receiver, requiredTokenAmount);
-        } else {
-            revert UnknownPayToken(payToken);
-        }
+        _settle(sender, subscriptionType);
     }
 
     function getFeeCollector() external view returns (address) {
@@ -306,11 +309,33 @@ contract Subscription is ReentrancyGuard {
     }
 
     function setSubscriptionPeriod(uint subscriptionType, uint32 periodSeconds) onlyOwner external {
-        // type 0 is the "unset / never subscribed" sentinel in _activeType;
-        // allowing it here would let users pay while _activeType stays 0, locking them out.
+        // type 0 is the "unset / never subscribed" sentinel in _activeType.
+        // Zero period would brick renew/settle/_requireDue for existing subscribers — use
+        // delistSubscription to stop new sign-ups instead.
         if (subscriptionType == 0) revert InvalidSubscriptionType(0);
+        if (periodSeconds == 0) revert UnknownPeriod();
         _subscriptionPeriods[subscriptionType] = periodSeconds;
         emit SubscriptionPeriodChanged(subscriptionType, periodSeconds);
+    }
+
+    function isListed(uint subscriptionType) external view returns (bool) {
+        return _subscriptionListed[subscriptionType];
+    }
+
+    function listSubscription(uint subscriptionType) onlyOwner external {
+        if (subscriptionType == 0) revert InvalidSubscriptionType(0);
+        if (_subscriptionListed[subscriptionType]) revert AlreadyListed(subscriptionType);
+        // Require price and period configured before opening to new subscribers.
+        if (_subscriptionPrices[subscriptionType] == 0) revert InvalidSubscriptionType(subscriptionType);
+        if (_subscriptionPeriods[subscriptionType] == 0) revert UnknownPeriod();
+        _subscriptionListed[subscriptionType] = true;
+        emit SubscriptionListed(subscriptionType);
+    }
+
+    function delistSubscription(uint subscriptionType) onlyOwner external {
+        if (!_subscriptionListed[subscriptionType]) revert NotListed(subscriptionType);
+        _subscriptionListed[subscriptionType] = false;
+        emit SubscriptionDelisted(subscriptionType);
     }
 
     function getNextChargeableAt(address account, uint subscriptionType) external view returns (uint) {
@@ -348,7 +373,10 @@ contract Subscription is ReentrancyGuard {
     }
 
     function setSubscriptionPrice(uint subscriptionType, uint price) onlyOwner external {
+        // Zero price would brick _priceOf for existing subscribers — use delistSubscription
+        // to stop new sign-ups instead.
         if (subscriptionType == 0) revert InvalidSubscriptionType(0);
+        if (price == 0) revert InvalidSubscriptionType(subscriptionType);
         _subscriptionPrices[subscriptionType] = price;
         emit SubscriptionPriceChanged(subscriptionType, price);
     }
@@ -475,7 +503,7 @@ contract Subscription is ReentrancyGuard {
     }
 
     function setOwner(address new_owner) onlyOwner external {
-        if (new_owner == address(0)) revert ZeroAddress();
+        if (new_owner == address(0) || new_owner == address(this)) revert ZeroAddress();
         _pendingOwner = new_owner;
         emit PendingOwnerChanged(new_owner);
     }
@@ -571,21 +599,57 @@ contract Subscription is ReentrancyGuard {
     }
 
     function _requireDue(address account, uint subscriptionType) private view {
+        // Only block NEW subscriptions for delisted types — existing subscribers can still
+        // renew, settle, and cancel even after delist.
+        if (!_subscriptionListed[subscriptionType]) revert NotListed(subscriptionType);
         uint32 period = _subscriptionPeriods[subscriptionType];
         if (period == 0) revert UnknownPeriod();
         uint next = _nextChargeableAt[account][subscriptionType];
         if (next != 0 && block.timestamp < next) revert NotDueYet(next);
     }
 
-    function _requireSettled(address account, uint subscriptionType) private view {
+    function _settleIfDebt(address account, uint subscriptionType) private {
         uint next = _nextChargeableAt[account][subscriptionType];
-        if (next != 0 && block.timestamp >= next) revert UnsettledDebt(next);
+        if (next == 0) return; // not subscribed to this type
+        if (block.timestamp < next) return; // not in debt
+        _settle(account, subscriptionType);
+    }
+
+    function _settle(address account, uint subscriptionType) private {
+        // Caller MUST have verified _nextChargeableAt[account][subscriptionType] != 0
+        // AND block.timestamp >= that value (i.e. debt exists).
+        uint next = _nextChargeableAt[account][subscriptionType];
+        uint32 period = _subscriptionPeriods[subscriptionType];
+        if (period == 0) revert UnknownPeriod();
+        uint periodsCharged = (block.timestamp - next) / period + 1;
+        _nextChargeableAt[account][subscriptionType] = next + periodsCharged * period;
+        uint8 payToken = _activePayToken[account];
+        uint price = _priceOf(subscriptionType, payToken);
+        uint requiredTokenAmount;
+        if (payToken == PAY_TOKEN_USDT) {
+            requiredTokenAmount = _calculateAmountUSDT(price) * periodsCharged;
+            emit DebtSettled(account, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
+            _usdt.safeTransferFrom(account, _receiver, requiredTokenAmount);
+        } else if (payToken == PAY_TOKEN_COAI) {
+            requiredTokenAmount = _calculateAmountCOAI(price) * periodsCharged;
+            emit DebtSettled(account, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
+            _coai.safeTransferFrom(account, _receiver, requiredTokenAmount);
+        } else if (payToken == PAY_TOKEN_USDC) {
+            requiredTokenAmount = _calculateAmountUSDC(price) * periodsCharged;
+            emit DebtSettled(account, subscriptionType, payToken, price, requiredTokenAmount, periodsCharged, block.timestamp);
+            _usdc.safeTransferFrom(account, _receiver, requiredTokenAmount);
+        } else {
+            revert UnknownPayToken(payToken);
+        }
     }
 
     function _activate(address account, uint subscriptionType, uint8 payToken) private {
         uint previous = _activeType[account];
         if (previous != 0) {
-            _requireSettled(account, previous);
+            // Auto-settle any outstanding debt on the previous type so the caller cannot
+            // walk away from / switch out of unpaid periods. Charges in the previous
+            // pay token; the new type's first period is charged separately by the caller.
+            _settleIfDebt(account, previous);
             if (previous != subscriptionType) {
                 delete _nextChargeableAt[account][previous];
                 emit SubscriptionSwitched(account, previous, subscriptionType);
