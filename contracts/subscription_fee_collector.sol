@@ -181,16 +181,26 @@ contract Subscription is ReentrancyGuard {
     // user => payToken used at last subscribe (PAY_TOKEN_USDT / _COAI / _USDC). Determines renew currency.
     mapping(address => uint8) private _activePayToken;
 
-    // subscriptionType id constants
-    uint constant SUB_TYPE_PLUS_MONTH = 1;
-    uint constant SUB_TYPE_PRO_MONTH  = 2;
-    uint constant SUB_TYPE_PLUS_YEAR  = 3;
-    uint constant SUB_TYPE_PRO_YEAR   = 4;
+    // subscriptionType id constants. Tier order (low → high): GO < PLUS < PREMIUM < PRO.
+    // IDs 1-4 are monthly plans in tier order, 5-8 are yearly plans in tier order.
+    uint constant SUB_TYPE_GO_MONTH      = 1;
+    uint constant SUB_TYPE_PLUS_MONTH    = 2;
+    uint constant SUB_TYPE_PREMIUM_MONTH = 3;
+    uint constant SUB_TYPE_PRO_MONTH     = 4;
+    uint constant SUB_TYPE_GO_YEAR       = 5;
+    uint constant SUB_TYPE_PLUS_YEAR     = 6;
+    uint constant SUB_TYPE_PREMIUM_YEAR  = 7;
+    uint constant SUB_TYPE_PRO_YEAR      = 8;
 
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH = 1999000000;
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH  = 19999000000;
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR  = 19188000000;
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR   = 191988000000;
+    // Prices in USD * 10^USD_DECIMALS (USD * 1e8).
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH      = 500000000;       // $5
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH    = 1999000000;      // $19.99
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH = 10000000000;     // $100
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH     = 20000000000;     // $200
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR       = 4800000000;      // $48 = $4 * 12
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR     = 19188000000;     // $191.88 = $15.99 * 12
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR  = 96000000000;     // $960 = $80 * 12
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR      = 192000000000;    // $1920 = $160 * 12
     uint constant DISCOUNT_BASE = 1000;
     uint constant DEFAULT_DISCOUNT_COAI = 700; // 30% off, applied only to COAI payments by default
     uint32 constant PERIOD_MONTH = 30 days;
@@ -236,35 +246,59 @@ contract Subscription is ReentrancyGuard {
         _owner = address(timelock);
         emit OwnerChanged(address(0), _owner);
         _switch = true;
-        _subscriptionPrices[SUB_TYPE_PLUS_MONTH] = DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH;
-        _subscriptionPrices[SUB_TYPE_PRO_MONTH]  = DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH;
-        _subscriptionPrices[SUB_TYPE_PLUS_YEAR]  = DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR;
-        _subscriptionPrices[SUB_TYPE_PRO_YEAR]   = DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR;
-        emit SubscriptionPriceChanged(SUB_TYPE_PLUS_MONTH, DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH);
-        emit SubscriptionPriceChanged(SUB_TYPE_PRO_MONTH,  DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH);
-        emit SubscriptionPriceChanged(SUB_TYPE_PLUS_YEAR,  DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR);
-        emit SubscriptionPriceChanged(SUB_TYPE_PRO_YEAR,   DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR);
+        _subscriptionPrices[SUB_TYPE_GO_MONTH]      = DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH;
+        _subscriptionPrices[SUB_TYPE_PLUS_MONTH]    = DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH;
+        _subscriptionPrices[SUB_TYPE_PREMIUM_MONTH] = DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH;
+        _subscriptionPrices[SUB_TYPE_PRO_MONTH]     = DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH;
+        _subscriptionPrices[SUB_TYPE_GO_YEAR]       = DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR;
+        _subscriptionPrices[SUB_TYPE_PLUS_YEAR]     = DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR;
+        _subscriptionPrices[SUB_TYPE_PREMIUM_YEAR]  = DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR;
+        _subscriptionPrices[SUB_TYPE_PRO_YEAR]      = DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR;
+        emit SubscriptionPriceChanged(SUB_TYPE_GO_MONTH,      DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH);
+        emit SubscriptionPriceChanged(SUB_TYPE_PLUS_MONTH,    DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH);
+        emit SubscriptionPriceChanged(SUB_TYPE_PREMIUM_MONTH, DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH);
+        emit SubscriptionPriceChanged(SUB_TYPE_PRO_MONTH,     DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH);
+        emit SubscriptionPriceChanged(SUB_TYPE_GO_YEAR,       DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR);
+        emit SubscriptionPriceChanged(SUB_TYPE_PLUS_YEAR,     DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR);
+        emit SubscriptionPriceChanged(SUB_TYPE_PREMIUM_YEAR,  DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR);
+        emit SubscriptionPriceChanged(SUB_TYPE_PRO_YEAR,      DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR);
         _discounts[PAY_TOKEN_USDT] = DISCOUNT_BASE; // no discount for USDT
         _discounts[PAY_TOKEN_COAI] = DEFAULT_DISCOUNT_COAI;
         _discounts[PAY_TOKEN_USDC] = DISCOUNT_BASE; // no discount for USDC
         emit DiscountChanged(PAY_TOKEN_USDT, DISCOUNT_BASE);
         emit DiscountChanged(PAY_TOKEN_COAI, DEFAULT_DISCOUNT_COAI);
         emit DiscountChanged(PAY_TOKEN_USDC, DISCOUNT_BASE);
-        _subscriptionPeriods[SUB_TYPE_PLUS_MONTH] = PERIOD_MONTH;
-        _subscriptionPeriods[SUB_TYPE_PRO_MONTH]  = PERIOD_MONTH;
-        _subscriptionPeriods[SUB_TYPE_PLUS_YEAR]  = PERIOD_YEAR;
-        _subscriptionPeriods[SUB_TYPE_PRO_YEAR]   = PERIOD_YEAR;
-        emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_MONTH, PERIOD_MONTH);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PRO_MONTH,  PERIOD_MONTH);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_YEAR,  PERIOD_YEAR);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PRO_YEAR,   PERIOD_YEAR);
-        _subscriptionListed[SUB_TYPE_PLUS_MONTH] = true;
-        _subscriptionListed[SUB_TYPE_PRO_MONTH]  = true;
-        _subscriptionListed[SUB_TYPE_PLUS_YEAR]  = true;
-        _subscriptionListed[SUB_TYPE_PRO_YEAR]   = true;
+        _subscriptionPeriods[SUB_TYPE_GO_MONTH]      = PERIOD_MONTH;
+        _subscriptionPeriods[SUB_TYPE_PLUS_MONTH]    = PERIOD_MONTH;
+        _subscriptionPeriods[SUB_TYPE_PREMIUM_MONTH] = PERIOD_MONTH;
+        _subscriptionPeriods[SUB_TYPE_PRO_MONTH]     = PERIOD_MONTH;
+        _subscriptionPeriods[SUB_TYPE_GO_YEAR]       = PERIOD_YEAR;
+        _subscriptionPeriods[SUB_TYPE_PLUS_YEAR]     = PERIOD_YEAR;
+        _subscriptionPeriods[SUB_TYPE_PREMIUM_YEAR]  = PERIOD_YEAR;
+        _subscriptionPeriods[SUB_TYPE_PRO_YEAR]      = PERIOD_YEAR;
+        emit SubscriptionPeriodChanged(SUB_TYPE_GO_MONTH,      PERIOD_MONTH);
+        emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_MONTH,    PERIOD_MONTH);
+        emit SubscriptionPeriodChanged(SUB_TYPE_PREMIUM_MONTH, PERIOD_MONTH);
+        emit SubscriptionPeriodChanged(SUB_TYPE_PRO_MONTH,     PERIOD_MONTH);
+        emit SubscriptionPeriodChanged(SUB_TYPE_GO_YEAR,       PERIOD_YEAR);
+        emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_YEAR,     PERIOD_YEAR);
+        emit SubscriptionPeriodChanged(SUB_TYPE_PREMIUM_YEAR,  PERIOD_YEAR);
+        emit SubscriptionPeriodChanged(SUB_TYPE_PRO_YEAR,      PERIOD_YEAR);
+        _subscriptionListed[SUB_TYPE_GO_MONTH]      = true;
+        _subscriptionListed[SUB_TYPE_PLUS_MONTH]    = true;
+        _subscriptionListed[SUB_TYPE_PREMIUM_MONTH] = true;
+        _subscriptionListed[SUB_TYPE_PRO_MONTH]     = true;
+        _subscriptionListed[SUB_TYPE_GO_YEAR]       = true;
+        _subscriptionListed[SUB_TYPE_PLUS_YEAR]     = true;
+        _subscriptionListed[SUB_TYPE_PREMIUM_YEAR]  = true;
+        _subscriptionListed[SUB_TYPE_PRO_YEAR]      = true;
+        emit SubscriptionListed(SUB_TYPE_GO_MONTH);
         emit SubscriptionListed(SUB_TYPE_PLUS_MONTH);
+        emit SubscriptionListed(SUB_TYPE_PREMIUM_MONTH);
         emit SubscriptionListed(SUB_TYPE_PRO_MONTH);
+        emit SubscriptionListed(SUB_TYPE_GO_YEAR);
         emit SubscriptionListed(SUB_TYPE_PLUS_YEAR);
+        emit SubscriptionListed(SUB_TYPE_PREMIUM_YEAR);
         emit SubscriptionListed(SUB_TYPE_PRO_YEAR);
     }
 
