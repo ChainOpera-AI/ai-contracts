@@ -5,6 +5,7 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/governance/TimelockController.sol";
+import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./lib/IPancakeV3PoolState.sol";
 import "./lib/TickMath.sol";
 
@@ -18,6 +19,7 @@ contract Subscription is ReentrancyGuard {
     error InvalidSubscriptionType(uint subscriptionType);
     error InvalidDiscount();
     error NotFeeCollector(address feeCollector, address caller);
+    error NotSubscriptionTerminator(address subscriptionTerminator, address caller);
     error NotDueYet(uint nextChargeableAt);
     error NotSubscribed();
     error UnknownPeriod();
@@ -97,6 +99,15 @@ contract Subscription is ReentrancyGuard {
     event FeeCollectorChanged(
         address indexed new_feeCollector
     );
+    event SubscriptionTerminatorChanged(
+        address indexed new_subscriptionTerminator
+    );
+    event SubscriptionTerminated(
+        address indexed account,
+        uint indexed subscriptionType,
+        address indexed terminator,
+        uint terminatedAt
+    );
     event SubscriptionPeriodChanged(
         uint indexed subscriptionType,
         uint32 new_periodSeconds
@@ -154,6 +165,10 @@ contract Subscription is ReentrancyGuard {
     // payToken => discount numerator, denominator = DISCOUNT_BASE. e.g. 700 / 1000 = 30% off
     mapping(uint8 => uint) private _discounts;
     address private _feeCollector;
+    // Privileged role that can force-cancel any subscription, ignoring debt. Intended as an
+    // escape hatch for accounts that have become unable to pay and would otherwise accrue
+    // unsettleable debt forever.
+    address private _subscriptionTerminator;
     // subscriptionType => recurring period in seconds (0 = non-recurring/undefined)
     mapping(uint => uint32) private _subscriptionPeriods;
     // subscriptionType => listed (true => accepting new subscriptions). Delisting only blocks new
@@ -185,20 +200,16 @@ contract Subscription is ReentrancyGuard {
     uint8 constant PAY_TOKEN_COAI = 2;
     uint8 constant PAY_TOKEN_USDC = 3;
 
-    uint constant RATE = 2**96;
     // rawAmount uses Chainlink-style fixed-point USD: USD * 1e8 (e.g. $19.99 -> 1_999_000_000)
     uint8 constant USD_DECIMALS = 8;
-    // sqrt(10**18); used to downscale sqrtPriceX96 before squaring to avoid uint256 overflow.
-    // Tied to COAI/quote both having 18 decimals — enforced in constructor and setCOAIAddress.
-    uint constant SQRT_PRICE_SCALE = 1e9;
     uint32 constant TWAP_INTERVAL = 1800; // 30 minutes
-    address constant DEFAULT_PANCAKE_COAI_POOL = 0xbc0E5A205D729299D93973d634E2507CD8b625A3;
+    address constant DEFAULT_PANCAKE_COAI_POOL = 0x778121B464151FE5d931587c457E48FcAaA0dc7A;
     address constant DEFAULT_USDT = 0x55d398326f99059fF775485246999027B3197955;
     address constant DEFAULT_COAI = 0x0A8D6C86e1bcE73fE4D0bD531e1a567306836EA5;
     address constant DEFAULT_USDC = 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d;
 
-    constructor(address receiver, address feeCollector, uint minDelay, address[] memory proposers, address[] memory executors, address admin) {
-        if (receiver == address(0) || feeCollector == address(0)) revert ZeroAddress();
+    constructor(address receiver, address feeCollector, address subscriptionTerminator, uint minDelay, address[] memory proposers, address[] memory executors, address admin) {
+        if (receiver == address(0) || feeCollector == address(0) || subscriptionTerminator == address(0)) revert ZeroAddress();
         if (receiver == address(this)) revert InvalidReceiver();
         // admin holds TIMELOCK_ADMIN_ROLE and can grant/revoke proposer/executor roles
         // without the delay, defeating the timelock — must be zero, the timelock self-administers.
@@ -208,6 +219,8 @@ contract Subscription is ReentrancyGuard {
         if (proposers.length == 0 || executors.length == 0) revert InvalidTimelockConfig();
         _feeCollector = feeCollector;
         emit FeeCollectorChanged(feeCollector);
+        _subscriptionTerminator = subscriptionTerminator;
+        emit SubscriptionTerminatorChanged(subscriptionTerminator);
         _twapInterval = TWAP_INTERVAL;
         _usdt = ERC20(DEFAULT_USDT);
         _usdtDecimals = ERC20(DEFAULT_USDT).decimals();
@@ -271,6 +284,25 @@ contract Subscription is ReentrancyGuard {
         _renew(account);
     }
 
+    function renewBatch(address[] calldata accounts) onlyFeeCollector external nonReentrant {
+        for (uint i = 0; i < accounts.length; i++) {
+            _renew(accounts[i]);
+        }
+    }
+
+    /// @notice Force-cancel `account`'s active subscription without settling any debt.
+    /// Only callable by `_subscriptionTerminator`. Intended for accounts that have become
+    /// unable to pay (lost approval, drained balance, etc.) so their unsettleable debt
+    /// doesn't grow forever. Not gated by switchOn — must still work while paused.
+    function terminateSubscription(address account) onlySubscriptionTerminator external {
+        uint subscriptionType = _activeType[account];
+        if (subscriptionType == 0) revert NotSubscribed();
+        delete _nextChargeableAt[account][subscriptionType];
+        delete _activeType[account];
+        delete _activePayToken[account];
+        emit SubscriptionTerminated(account, subscriptionType, msg.sender, block.timestamp);
+    }
+
     function cancelSubscription() external nonReentrant {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
@@ -302,6 +334,16 @@ contract Subscription is ReentrancyGuard {
         if (new_feeCollector == address(0)) revert ZeroAddress();
         _feeCollector = new_feeCollector;
         emit FeeCollectorChanged(new_feeCollector);
+    }
+
+    function getSubscriptionTerminator() external view returns (address) {
+        return _subscriptionTerminator;
+    }
+
+    function setSubscriptionTerminator(address new_subscriptionTerminator) onlyOwner external {
+        if (new_subscriptionTerminator == address(0)) revert ZeroAddress();
+        _subscriptionTerminator = new_subscriptionTerminator;
+        emit SubscriptionTerminatorChanged(new_subscriptionTerminator);
     }
 
     function getSubscriptionPeriod(uint subscriptionType) external view returns (uint32) {
@@ -532,6 +574,11 @@ contract Subscription is ReentrancyGuard {
         _;
     }
 
+    modifier onlySubscriptionTerminator() {
+        if (msg.sender != _subscriptionTerminator) revert NotSubscriptionTerminator(_subscriptionTerminator, msg.sender);
+        _;
+    }
+
     modifier switchOn() {
         if (!_switch) revert SwitchOff();
         _;
@@ -676,20 +723,30 @@ contract Subscription is ReentrancyGuard {
 
     function _calculateAmountCOAI(uint rawAmount) private view returns (uint) {
         // PancakeV3 pool with COAI paired against a USD-stable quote (both 18 decimals; COAI enforced).
-        // sqrtPriceX96 is sqrt(token1 / token0) * 2^96.
-        // If COAI is token0: price = sqrtPriceX96^2 / 2^192 = quote-per-COAI.
-        // If COAI is token1: price = 2^192 / sqrtPriceX96^2 = quote-per-COAI (inverted).
-        // Downscale sqrtPriceX96 by sqrt(10^coaiDec) / 2^96 = SQRT_PRICE_SCALE/RATE to avoid overflow on squaring.
+        // sqrtPriceX96 = sqrt(token1_wei / token0_wei) * 2^96. We compute the COAI amount in wei
+        // using Math.mulDiv (512-bit intermediates) so this works across the full price range
+        // without overflow (extreme-price token1 path) or silent truncation-to-zero (very small
+        // sqrtPriceX96). Same precision/safety pattern as Uniswap V3 OracleLibrary.getQuoteAtTick.
         uint160 sqrtPriceX96 = _getCoaiTwapSqrtPriceX96();
-        uint sqrtPrice = uint(sqrtPriceX96) * SQRT_PRICE_SCALE / RATE;
-        uint numerator = rawAmount * (10 ** _coaiDecimals) * (10 ** (_coaiDecimals - USD_DECIMALS));
-        if (_coaiIsToken0) {
-            // coaiAmount = numerator / sqrtPrice^2
-            return numerator / sqrtPrice / sqrtPrice;
+        if (sqrtPriceX96 == 0) revert TWAPNotAvailable();
+
+        // baseAmount = quote-token wei equivalent of rawAmount USD (assumes 18-dec USD-stable quote).
+        uint baseAmount = rawAmount * (10 ** (_coaiDecimals - USD_DECIMALS));
+
+        // COAI is token0  =>  USDT is token1  =>  coaiAmount = baseAmount / (token1/token0)
+        // COAI is token1  =>  USDT is token0  =>  coaiAmount = baseAmount * (token1/token0)
+        if (sqrtPriceX96 <= type(uint128).max) {
+            // Square fits in uint256 directly (Q192 ratio).
+            uint ratioX192 = uint(sqrtPriceX96) * sqrtPriceX96;
+            return _coaiIsToken0
+                ? Math.mulDiv(1 << 192, baseAmount, ratioX192)
+                : Math.mulDiv(ratioX192, baseAmount, 1 << 192);
         } else {
-            // coaiAmount = numerator * sqrtPrice^2 / 10^(2*coaiDec)
-            // (sqrtPrice^2 has implicit 10^coaiDec scaling factor; divide it out twice via 10^coaiDec each)
-            return numerator * sqrtPrice / (10 ** _coaiDecimals) * sqrtPrice / (10 ** _coaiDecimals);
+            // sqrtPriceX96^2 would overflow uint256; scale down by 2^64 first (Q128 ratio).
+            uint ratioX128 = Math.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 64);
+            return _coaiIsToken0
+                ? Math.mulDiv(1 << 128, baseAmount, ratioX128)
+                : Math.mulDiv(ratioX128, baseAmount, 1 << 128);
         }
     }
 
@@ -719,9 +776,16 @@ contract Subscription is ReentrancyGuard {
             int256 tickDelta = int256(tickCumulatives[1]) - int256(tickCumulatives[0]);
             int256 interval = int256(uint256(_twapInterval));
             int256 rawAvgTick = tickDelta / interval;
+            // First bound to int24 range so the narrowing cast below is lossless.
             if (rawAvgTick < int256(TickMath.MIN_TICK) || rawAvgTick > int256(TickMath.MAX_TICK)) revert TWAPNotAvailable();
             int24 avgTick = int24(rawAvgTick);
             if (tickDelta < 0 && (tickDelta % interval != 0)) avgTick--;
+            // Re-check AFTER the floor correction. At the lower boundary the decrement
+            // can push avgTick to MIN_TICK-1, which would make getSqrtRatioAtTick revert
+            // with TickOutOfRange — and that revert sits inside the try-success block, so
+            // it would NOT be caught by `catch` below and would leak out instead of the
+            // intended TWAPNotAvailable. Mirrors the final clamp in _isCoaiTwapHealthy.
+            if (avgTick < TickMath.MIN_TICK || avgTick > TickMath.MAX_TICK) revert TWAPNotAvailable();
             return TickMath.getSqrtRatioAtTick(avgTick);
         } catch {
             revert TWAPNotAvailable();
