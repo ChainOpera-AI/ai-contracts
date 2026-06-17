@@ -213,7 +213,7 @@ contract Subscription is ReentrancyGuard {
     // rawAmount uses Chainlink-style fixed-point USD: USD * 1e8 (e.g. $19.99 -> 1_999_000_000)
     uint8 constant USD_DECIMALS = 8;
     uint32 constant TWAP_INTERVAL = 1800; // 30 minutes
-    address constant DEFAULT_PANCAKE_COAI_POOL = 0x778121B464151FE5d931587c457E48FcAaA0dc7A;
+    address constant DEFAULT_PANCAKE_COAI_POOL = 0xbc0E5A205D729299D93973d634E2507CD8b625A3;
     address constant DEFAULT_USDT = 0x55d398326f99059fF775485246999027B3197955;
     address constant DEFAULT_COAI = 0x0A8D6C86e1bcE73fE4D0bD531e1a567306836EA5;
     address constant DEFAULT_USDC = 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d;
