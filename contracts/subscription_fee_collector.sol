@@ -38,22 +38,26 @@ contract Subscription is ReentrancyGuard {
     error InvalidTimelockConfig();
     error NotListed(uint subscriptionType);
     error AlreadyListed(uint subscriptionType);
+    error InvalidInviter();
 
     event SubscribedUSDT(
         address indexed account,
         uint indexed subscriptionType,
+        address indexed inviter,
         uint amount,
         uint requiredUSDTAmount
     );
     event SubscribedCOAI(
         address indexed account,
         uint indexed subscriptionType,
+        address indexed inviter,
         uint amount,
         uint requiredCOAIAmount
     );
     event SubscribedUSDC(
         address indexed account,
         uint indexed subscriptionType,
+        address indexed inviter,
         uint amount,
         uint requiredUSDCAmount
     );
@@ -180,6 +184,10 @@ contract Subscription is ReentrancyGuard {
     mapping(address => uint) private _activeType;
     // user => payToken used at last subscribe (PAY_TOKEN_USDT / _COAI / _USDC). Determines renew currency.
     mapping(address => uint8) private _activePayToken;
+    // user => inviter (referrer) address. Required (non-zero) on every subscribeXXX call;
+    // each successful subscribe overwrites the stored value, so users can switch their referrer
+    // on a later call. Subscribers cannot invite themselves. Persists across cancel/terminate.
+    mapping(address => address) private _inviters;
 
     // subscriptionType id constants. Tier order (low → high): GO < PLUS < PREMIUM < PRO.
     // IDs 1-4 are monthly plans in tier order, 5-8 are yearly plans in tier order.
@@ -302,16 +310,16 @@ contract Subscription is ReentrancyGuard {
         emit SubscriptionListed(SUB_TYPE_PRO_YEAR);
     }
 
-    function subscriptionUSDT(uint subscriptionType) switchOn external nonReentrant {
-        _subscriptionUSDT(subscriptionType);
+    function subscriptionUSDT(uint subscriptionType, address inviter) switchOn external nonReentrant {
+        _subscriptionUSDT(subscriptionType, inviter);
     }
 
-    function subscriptionCOAI(uint subscriptionType) switchOn external nonReentrant {
-        _subscriptionCOAI(subscriptionType);
+    function subscriptionCOAI(uint subscriptionType, address inviter) switchOn external nonReentrant {
+        _subscriptionCOAI(subscriptionType, inviter);
     }
 
-    function subscriptionUSDC(uint subscriptionType) switchOn external nonReentrant {
-        _subscriptionUSDC(subscriptionType);
+    function subscriptionUSDC(uint subscriptionType, address inviter) switchOn external nonReentrant {
+        _subscriptionUSDC(subscriptionType, inviter);
     }
 
     function renew(address account) onlyFeeCollector external nonReentrant {
@@ -424,6 +432,10 @@ contract Subscription is ReentrancyGuard {
 
     function getActivePayToken(address account) external view returns (uint8) {
         return _activePayToken[account];
+    }
+
+    function getInviter(address account) external view returns (address) {
+        return _inviters[account];
     }
 
     function nextChargeableAt(address account) external view returns (uint) {
@@ -618,34 +630,45 @@ contract Subscription is ReentrancyGuard {
         _;
     }
 
-    function _subscriptionUSDT(uint subscriptionType) private {
+    function _subscriptionUSDT(uint subscriptionType, address inviter) private {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
+        _recordInviter(sender, inviter);
         uint price = _priceOf(subscriptionType, PAY_TOKEN_USDT);
         uint requiredUSDTAmount = _calculateAmountUSDT(price);
         _activate(sender, subscriptionType, PAY_TOKEN_USDT);
-        emit SubscribedUSDT(sender, subscriptionType, price, requiredUSDTAmount);
+        emit SubscribedUSDT(sender, subscriptionType, inviter, price, requiredUSDTAmount);
         _usdt.safeTransferFrom(sender, _receiver, requiredUSDTAmount);
     }
 
-    function _subscriptionCOAI(uint subscriptionType) private {
+    function _subscriptionCOAI(uint subscriptionType, address inviter) private {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
+        _recordInviter(sender, inviter);
         uint price = _priceOf(subscriptionType, PAY_TOKEN_COAI);
         uint requiredCOAIAmount = _calculateAmountCOAI(price);
         _activate(sender, subscriptionType, PAY_TOKEN_COAI);
-        emit SubscribedCOAI(sender, subscriptionType, price, requiredCOAIAmount);
+        emit SubscribedCOAI(sender, subscriptionType, inviter, price, requiredCOAIAmount);
         _coai.safeTransferFrom(sender, _receiver, requiredCOAIAmount);
     }
 
-    function _subscriptionUSDC(uint subscriptionType) private {
+    function _subscriptionUSDC(uint subscriptionType, address inviter) private {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
+        _recordInviter(sender, inviter);
         uint price = _priceOf(subscriptionType, PAY_TOKEN_USDC);
         uint requiredUSDCAmount = _calculateAmountUSDC(price);
         _activate(sender, subscriptionType, PAY_TOKEN_USDC);
-        emit SubscribedUSDC(sender, subscriptionType, price, requiredUSDCAmount);
+        emit SubscribedUSDC(sender, subscriptionType, inviter, price, requiredUSDCAmount);
         _usdc.safeTransferFrom(sender, _receiver, requiredUSDCAmount);
+    }
+
+    /// @dev Refreshable inviter recording. `inviter` is mandatory: must be non-zero and
+    /// not equal to `sender` (self-referral blocked). Every successful subscribe overwrites
+    /// the stored value, so users can switch their referrer on a later subscribe call.
+    function _recordInviter(address sender, address inviter) private {
+        if (inviter == address(0) || inviter == sender) revert InvalidInviter();
+        _inviters[sender] = inviter;
     }
 
     function _renew(address account) private {
