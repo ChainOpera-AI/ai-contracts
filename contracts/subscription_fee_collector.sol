@@ -667,7 +667,7 @@ contract Subscription is ReentrancyGuard {
     /// not equal to `sender` (self-referral blocked). Every successful subscribe overwrites
     /// the stored value, so users can switch their referrer on a later subscribe call.
     function _recordInviter(address sender, address inviter) private {
-        if (inviter == address(0) || inviter == sender) revert InvalidInviter();
+        if (inviter == sender) revert InvalidInviter();
         _inviters[sender] = inviter;
     }
 
