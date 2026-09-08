@@ -23,3 +23,7 @@ node_modules
 .lst
 scripts/merkle-proof/target/
 .vscode
+
+# Foundry
+out/
+cache/

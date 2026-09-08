@@ -1,0 +1,14 @@
+# Solidity dependencies come from npm (see package.json), not from foundry's lib/.
+# Run `npm install` once before `forge test`.
+[profile.default]
+src = "contracts"
+test = "test"
+out = "out"
+libs = []
+optimizer = true
+optimizer_runs = 200
+solc_version = "0.8.28"
+remappings = [
+    "@openzeppelin/=node_modules/@openzeppelin/",
+    "@chainlink/=node_modules/@chainlink/",
+]
