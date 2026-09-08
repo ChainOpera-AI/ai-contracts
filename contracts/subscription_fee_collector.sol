@@ -19,6 +19,7 @@ contract Subscription is ReentrancyGuard {
     error InvalidSubscriptionType(uint subscriptionType);
     error InvalidDiscount();
     error NotFeeCollector(address feeCollector, address caller);
+    error NotSelf(address caller);
     error NotSubscriptionTerminator(address subscriptionTerminator, address caller);
     error NotDueYet(uint nextChargeableAt);
     error NotSubscribed();
@@ -149,6 +150,16 @@ contract Subscription is ReentrancyGuard {
         uint requiredTokenAmount,
         uint periodsCharged,
         uint chargedAt
+    );
+    /// @dev Emitted by renewBatch only when at least one account failed to be charged.
+    /// `failedAccounts` holds exactly the accounts whose _renew reverted (insufficient
+    /// balance/approval, not due yet, unknown pay token, unhealthy price feed, ...); every
+    /// other account in the batch was charged normally. Individual revert reasons are not
+    /// captured — re-run renew(account) on a single address to surface the exact error.
+    event RenewBatchFailed(
+        address indexed caller,
+        uint failedCount,
+        address[] failedAccounts
     );
 
     ERC20 private _usdt;
@@ -326,10 +337,37 @@ contract Subscription is ReentrancyGuard {
         _renew(account);
     }
 
+    /// @notice Charge a batch of accounts, isolating failures instead of reverting the
+    /// whole batch: every account is attempted, and the ones that reverted are reported via
+    /// RenewBatchFailed. A failed account's state changes are rolled back with its sub-call,
+    /// so it stays exactly as it was and can simply be retried later.
     function renewBatch(address[] calldata accounts) onlyFeeCollector external nonReentrant {
+        address[] memory buffer = new address[](accounts.length);
+        uint failedCount;
         for (uint i = 0; i < accounts.length; i++) {
-            _renew(accounts[i]);
+            // Self-call so a revert can be caught: try/catch only wraps external calls.
+            try this.renewSelf(accounts[i]) {
+            } catch {
+                buffer[failedCount] = accounts[i];
+                failedCount++;
+            }
         }
+        if (failedCount == 0) return;
+        // Emit the exact-length list rather than the padded buffer.
+        address[] memory failedAccounts = new address[](failedCount);
+        for (uint i = 0; i < failedCount; i++) {
+            failedAccounts[i] = buffer[i];
+        }
+        emit RenewBatchFailed(msg.sender, failedCount, failedAccounts);
+    }
+
+    /// @notice renewBatch's per-account trampoline. Callable ONLY by this contract, so it
+    /// carries renewBatch's onlyFeeCollector authorization and cannot be used to bypass it.
+    /// @dev Deliberately NOT nonReentrant: it executes inside renewBatch's guard, and a
+    /// second guard would make every single call revert.
+    function renewSelf(address account) external {
+        if (msg.sender != address(this)) revert NotSelf(msg.sender);
+        _renew(account);
     }
 
     /// @notice Force-cancel `account`'s active subscription without settling any debt.
