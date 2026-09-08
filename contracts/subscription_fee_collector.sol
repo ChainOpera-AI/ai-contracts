@@ -23,6 +23,10 @@ contract Subscription is ReentrancyGuard {
     error NotSubscriptionTerminator(address subscriptionTerminator, address caller);
     error NotDueYet(uint nextChargeableAt);
     error NotSubscribed();
+    error AlreadyCancelled();
+    error NotCancelled();
+    error SubscriptionExpired(uint expiredAt);
+    error MustCancelFirst(uint activeSubscriptionType);
     error UnknownPeriod();
     error UnknownPayToken(uint8 payToken);
     error NoDebt();
@@ -123,6 +127,8 @@ contract Subscription is ReentrancyGuard {
     event SubscriptionDelisted(
         uint indexed subscriptionType
     );
+    /// @dev Only emitted on the cancel -> period elapsed -> subscribe-to-another-type path,
+    /// which is now the only way to change plan. Never emitted for a live switch.
     event SubscriptionSwitched(
         address indexed account,
         uint indexed previous_subscriptionType,
@@ -132,6 +138,11 @@ contract Subscription is ReentrancyGuard {
         address indexed account,
         uint indexed subscriptionType,
         uint cancelledAt
+    );
+    event SubscriptionRestored(
+        address indexed account,
+        uint indexed subscriptionType,
+        uint restoredAt
     );
     event DebtSettled(
         address indexed account,
@@ -195,6 +206,13 @@ contract Subscription is ReentrancyGuard {
     mapping(address => uint) private _activeType;
     // user => payToken used at last subscribe (PAY_TOKEN_USDT / _COAI / _USDC). Determines renew currency.
     mapping(address => uint8) private _activePayToken;
+    // user => cancelled flag. Cancelling does NOT tear the subscription down: the account keeps
+    // _activeType / _activePayToken / _nextChargeableAt and coasts on the period it already paid
+    // for, while renewals stop. Inside that window restoreSubscription() clears the flag and the
+    // subscription resumes untouched; once _nextChargeableAt elapses the subscription is over for
+    // good and only a fresh subscribeXXX brings it back. The stale _activeType is deliberately
+    // left behind — getEffectiveType() is what reports real entitlement.
+    mapping(address => bool) private _cancelled;
     // user => inviter (referrer) address. Required (non-zero) on every subscribeXXX call;
     // each successful subscribe overwrites the stored value, so users can switch their referrer
     // on a later call. Subscribers cannot invite themselves. Persists across cancel/terminate.
@@ -380,26 +398,51 @@ contract Subscription is ReentrancyGuard {
         delete _nextChargeableAt[account][subscriptionType];
         delete _activeType[account];
         delete _activePayToken[account];
+        delete _cancelled[account];
         emit SubscriptionTerminated(account, subscriptionType, msg.sender, block.timestamp);
     }
 
+    /// @notice Cancel the caller's subscription. Service is not cut off immediately: the
+    /// already-paid period runs to its end (_nextChargeableAt) and no further renewal is
+    /// charged. Within that window restoreSubscription() puts the same plan back at no cost;
+    /// once it elapses the subscription is over and a fresh subscribeXXX is required.
+    /// @dev Switching plans goes through here: cancel, wait the period out, then subscribe to
+    /// the new type. Subscribing straight into a different type is rejected by _requireDue.
     function cancelSubscription() external nonReentrant {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
+        if (_cancelled[sender]) revert AlreadyCancelled();
         // If the caller is in debt, auto-settle so users always exit fully paid up
-        // without needing a separate settleDebt tx first.
+        // without needing a separate settleDebt tx first. This is also what guarantees a
+        // cancelled account can never carry debt afterwards: renewals stop from here on.
         _settleIfDebt(sender, subscriptionType);
-        delete _nextChargeableAt[sender][subscriptionType];
-        delete _activeType[sender];
-        delete _activePayToken[sender];
+        _cancelled[sender] = true;
         emit SubscriptionCancelled(sender, subscriptionType, block.timestamp);
+    }
+
+    /// @notice Undo a cancellation while the paid-up period is still running. Free — that
+    /// period was already paid for — and it keeps the original plan, pay token and anchor, so
+    /// renewals just resume on the existing schedule. Once the period elapses this reverts
+    /// with SubscriptionExpired and the caller has to subscribe again.
+    function restoreSubscription() external nonReentrant {
+        address sender = msg.sender;
+        uint subscriptionType = _activeType[sender];
+        if (subscriptionType == 0) revert NotSubscribed();
+        if (!_cancelled[sender]) revert NotCancelled();
+        uint next = _nextChargeableAt[sender][subscriptionType];
+        if (block.timestamp >= next) revert SubscriptionExpired(next);
+        delete _cancelled[sender];
+        emit SubscriptionRestored(sender, subscriptionType, block.timestamp);
     }
 
     function settleDebt() external nonReentrant {
         address sender = msg.sender;
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
+        // A cancelled account was settled in full at cancel time and is never charged again,
+        // so an elapsed _nextChargeableAt marks the subscription's end, not a debt.
+        if (_cancelled[sender]) revert AlreadyCancelled();
         uint next = _nextChargeableAt[sender][subscriptionType];
         if (next == 0) revert NotSubscribed();
         if (block.timestamp < next) revert NoDebt();
@@ -464,8 +507,32 @@ contract Subscription is ReentrancyGuard {
         return _nextChargeableAt[account][subscriptionType];
     }
 
+    /// @notice Raw stored plan, which lingers after a cancelled period has elapsed.
+    /// Use getEffectiveType for actual entitlement.
     function getActiveType(address account) external view returns (uint) {
         return _activeType[account];
+    }
+
+    /// @notice The plan `account` is entitled to right now, or 0 if none. Unlike
+    /// getActiveType this reports 0 once a cancelled subscription's paid-up period has
+    /// elapsed. This is what the fee collector should build its renew batches from.
+    function getEffectiveType(address account) external view returns (uint) {
+        uint subscriptionType = _activeType[account];
+        if (subscriptionType == 0) return 0;
+        if (_cancelled[account] && block.timestamp >= _nextChargeableAt[account][subscriptionType]) return 0;
+        return subscriptionType;
+    }
+
+    function isCancelled(address account) external view returns (bool) {
+        return _cancelled[account];
+    }
+
+    /// @notice Whether restoreSubscription() would succeed for `account` right now.
+    function canRestore(address account) external view returns (bool) {
+        uint subscriptionType = _activeType[account];
+        if (subscriptionType == 0) return false;
+        if (!_cancelled[account]) return false;
+        return block.timestamp < _nextChargeableAt[account][subscriptionType];
     }
 
     function getActivePayToken(address account) external view returns (uint8) {
@@ -712,6 +779,10 @@ contract Subscription is ReentrancyGuard {
     function _renew(address account) private {
         uint subscriptionType = _activeType[account];
         if (subscriptionType == 0) revert NotSubscribed();
+        // Cancelled accounts coast on their paid-up period and are never charged again. The
+        // fee collector should filter these out (getEffectiveType) rather than rely on this
+        // revert, which would otherwise show up in RenewBatchFailed as noise.
+        if (_cancelled[account]) revert AlreadyCancelled();
         uint next = _nextChargeableAt[account][subscriptionType];
         if (next == 0) revert NotSubscribed();
         uint32 period = _subscriptionPeriods[subscriptionType];
@@ -740,14 +811,30 @@ contract Subscription is ReentrancyGuard {
         }
     }
 
+    /// @dev Gate for every subscribeXXX entry. Enforces the plan-change rule: an account may
+    /// only ever subscribe to the type it already holds, and moving to a different type
+    /// requires cancelSubscription() plus waiting out the paid-up period.
     function _requireDue(address account, uint subscriptionType) private view {
         // Only block NEW subscriptions for delisted types — existing subscribers can still
-        // renew, settle, and cancel even after delist.
+        // renew, settle, cancel, and restore even after delist.
         if (!_subscriptionListed[subscriptionType]) revert NotListed(subscriptionType);
         uint32 period = _subscriptionPeriods[subscriptionType];
         if (period == 0) revert UnknownPeriod();
-        uint next = _nextChargeableAt[account][subscriptionType];
-        if (next != 0 && block.timestamp < next) revert NotDueYet(next);
+        uint previous = _activeType[account];
+        if (previous == 0) return; // never subscribed (or terminated) — any listed type is open
+        // Invariant: a non-zero _activeType always has a non-zero anchor on that type.
+        uint previousNext = _nextChargeableAt[account][previous];
+        if (_cancelled[account]) {
+            // Cancelled: the paid-up period must run out before ANY new subscription, the
+            // same type included. Inside the window the only way back is restoreSubscription,
+            // which returns the already-paid plan for free.
+            if (block.timestamp < previousNext) revert NotDueYet(previousNext);
+            return;
+        }
+        // Active: no direct plan switch — cancel first, then subscribe once the period ends.
+        if (previous != subscriptionType) revert MustCancelFirst(previous);
+        // Same type: cannot pay ahead while the current period is still running.
+        if (block.timestamp < previousNext) revert NotDueYet(previousNext);
     }
 
     function _settleIfDebt(address account, uint subscriptionType) private {
@@ -788,21 +875,31 @@ contract Subscription is ReentrancyGuard {
     function _activate(address account, uint subscriptionType, uint8 payToken) private {
         uint previous = _activeType[account];
         if (previous != 0) {
-            // Auto-settle any outstanding debt on the previous type so the caller cannot
-            // walk away from / switch out of unpaid periods. Charges in the previous
-            // pay token; the new type's first period is charged separately by the caller.
-            _settleIfDebt(account, previous);
-            if (previous != subscriptionType) {
+            if (_cancelled[account]) {
+                // _requireDue has confirmed the paid-up period ran out, so the cancelled
+                // subscription is truly over. Drop both anchors and the flag so this counts as
+                // a brand-new subscription: the gap between cancelling and coming back is
+                // never billed, and the new plan starts from now rather than a stale anchor.
                 delete _nextChargeableAt[account][previous];
-                emit SubscriptionSwitched(account, previous, subscriptionType);
+                delete _nextChargeableAt[account][subscriptionType];
+                delete _cancelled[account];
+                if (previous != subscriptionType) {
+                    emit SubscriptionSwitched(account, previous, subscriptionType);
+                }
+            } else {
+                // Active resubscribe. _requireDue guarantees the type is unchanged and the
+                // period is up, so settle every period accrued since the anchor — the caller
+                // cannot walk away from unpaid periods — and this call pays for one more.
+                _settleIfDebt(account, previous);
             }
         }
         _activeType[account] = subscriptionType;
         _activePayToken[account] = payToken;
         uint32 period = _subscriptionPeriods[subscriptionType];
         uint next = _nextChargeableAt[account][subscriptionType];
-        // First subscribe (or post-cancel/switch fresh start): anchor at now + period.
-        // Existing anchor (same-type resubscribe before fee collector renews): advance by one period.
+        // Fresh start (first subscribe, post-terminate, or after a cancelled period elapsed):
+        // anchor at now + period. Existing anchor (same-type resubscribe once due): advance
+        // by one period.
         _nextChargeableAt[account][subscriptionType] = next == 0 ? block.timestamp + period : next + period;
     }
 
