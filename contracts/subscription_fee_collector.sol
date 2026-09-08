@@ -25,6 +25,10 @@ contract Subscription is ReentrancyGuard {
     error NotCancelled();
     error SubscriptionExpired(uint expiredAt);
     error MustCancelFirst(uint activeSubscriptionType);
+    error SettleDebtFirst(uint dueAt);
+    error NoScheduledChange();
+    error SameSubscriptionType();
+    error PendingChangeExists(uint pendingSubscriptionType);
     error UnknownPeriod();
     error UnknownPayToken(uint8 payToken);
     error NoDebt();
@@ -142,6 +146,42 @@ contract Subscription is ReentrancyGuard {
         uint indexed subscriptionType,
         uint restoredAt
     );
+    /// @dev A change that cost money and took effect immediately. `chargedAmount` is the USD
+    /// pro-rata top-up, `requiredTokenAmount` what was actually transferred.
+    event SubscriptionUpgraded(
+        address indexed account,
+        uint indexed previous_subscriptionType,
+        uint indexed new_subscriptionType,
+        uint8 payToken,
+        uint chargedAmount,
+        uint requiredTokenAmount,
+        uint nextChargeableAt
+    );
+    /// @dev A change worth nothing or less was parked until the paid-up period runs out. No
+    /// money moves here; SubscriptionDowngraded fires later when it actually lands.
+    event DowngradeScheduled(
+        address indexed account,
+        uint indexed current_subscriptionType,
+        uint indexed new_subscriptionType,
+        uint effectiveAt
+    );
+    event ScheduledChangeCancelled(
+        address indexed account,
+        uint indexed cancelled_subscriptionType
+    );
+    event SubscriptionDowngraded(
+        address indexed account,
+        uint indexed previous_subscriptionType,
+        uint indexed new_subscriptionType,
+        uint downgradedAt
+    );
+    /// @dev Plan swapped mid-trial: free, and the trial keeps its original end date.
+    event SubscriptionChangedDuringTrial(
+        address indexed account,
+        uint indexed previous_subscriptionType,
+        uint indexed new_subscriptionType,
+        uint trialEndsAt
+    );
     /// @dev Emitted instead of SubscribedUSDT/COAI/USDC when a subscribe starts a free trial:
     /// nothing is transferred, so no SubscribedXXX is emitted and revenue accounting stays clean.
     /// The first real charge lands at `trialEndsAt` via the fee collector's renew.
@@ -240,6 +280,14 @@ contract Subscription is ReentrancyGuard {
     // out and subscribe again for another free ride. Deliberately NOT cleared by
     // terminateSubscription — being force-cancelled does not earn a new trial.
     mapping(address => mapping(uint => bool)) private _trialUsed;
+    // user => the single pending end-of-period change, if any (0 = none). Holds the plan to
+    // move to when the paid-up period runs out. Mutually exclusive with _cancelled: both mean
+    // "something happens at the end of this period" and an account only ever has one such slot.
+    mapping(address => uint) private _pendingType;
+    // user => moment their free trial ends (0 = never had one). Only used to answer "is this
+    // account mid-trial right now", which decides whether a plan change is free. Never needs
+    // clearing: it simply falls into the past, and a plan change does not move it.
+    mapping(address => uint) private _trialEndsAt;
     // user => inviter (referrer) address. Required (non-zero) on every subscribeXXX call;
     // each successful subscribe overwrites the stored value, so users can switch their referrer
     // on a later call. Subscribers cannot invite themselves. Persists across cancel/terminate.
@@ -428,6 +476,8 @@ contract Subscription is ReentrancyGuard {
         delete _activeType[account];
         delete _activePayToken[account];
         delete _lockedPeriod[account];
+        delete _pendingType[account];
+        delete _trialEndsAt[account];
         delete _cancelled[account];
         emit SubscriptionTerminated(account, subscriptionType, msg.sender, block.timestamp);
     }
@@ -447,6 +497,8 @@ contract Subscription is ReentrancyGuard {
         // without needing a separate settleDebt tx first. This is also what guarantees a
         // cancelled account can never carry debt afterwards: renewals stop from here on.
         _settleIfDebt(sender, subscriptionType);
+        // Cancelling supersedes a parked downgrade: the slot now holds "ends at period end".
+        delete _pendingType[sender];
         _cancelled[sender] = true;
         emit SubscriptionCancelled(sender, subscriptionType, block.timestamp);
     }
@@ -464,6 +516,99 @@ contract Subscription is ReentrancyGuard {
         if (block.timestamp >= next) revert SubscriptionExpired(next);
         delete _cancelled[sender];
         emit SubscriptionRestored(sender, subscriptionType, block.timestamp);
+    }
+
+    /// @notice Move to `newType`. The caller states an intent; the contract decides what that
+    /// costs and when it happens:
+    /// - mid-trial: swaps immediately, charges nothing, and keeps the trial's end date
+    /// - worth money (an upgrade): swaps immediately and charges the pro-rata difference in the
+    ///   caller's existing pay token. Same-length plans keep their renewal date; changing to a
+    ///   plan of a different length restarts the cycle from now
+    /// - worth nothing or less (a downgrade): parked until the paid-up period runs out, because
+    ///   this contract holds no funds and so can never refund the difference
+    /// Passing the plan already held clears a parked downgrade. Use previewChange() first to
+    /// show the caller which of these will happen.
+    function changeSubscription(uint newType) switchOn external nonReentrant {
+        address sender = msg.sender;
+        uint currentType = _activeType[sender];
+        if (currentType == 0) revert NotSubscribed();
+        // A cancelled account is on its way out; restoreSubscription first.
+        if (_cancelled[sender]) revert AlreadyCancelled();
+
+        if (newType == currentType) {
+            // Not a change — the way to call off a parked downgrade.
+            if (_pendingType[sender] == 0) revert NoScheduledChange();
+            delete _pendingType[sender];
+            emit ScheduledChangeCancelled(sender, currentType);
+            return;
+        }
+        if (_subscriptionPrices[newType] == 0) revert InvalidSubscriptionType(newType);
+        if (_subscriptionPeriods[newType] == 0) revert UnknownPeriod();
+        if (!_subscriptionListed[newType]) revert NotListed(newType);
+
+        // Mid-trial: nothing has been paid yet, so there is no remaining value to protect and
+        // nothing to pro-rate. Swap the plan, keep the trial running to its original end.
+        if (block.timestamp < _trialEndsAt[sender]) {
+            _switchDuringTrial(sender, currentType, newType);
+            return;
+        }
+
+        uint next = _nextChargeableAt[sender][currentType];
+        // Pro-rating needs a period that is still running. In arrears the remaining time is
+        // negative, so make the caller square up first.
+        if (block.timestamp >= next) revert SettleDebtFirst(next);
+
+        int delta = _changeDeltaUSD(sender, currentType, newType, next);
+        if (delta <= 0) {
+            _pendingType[sender] = newType;
+            emit DowngradeScheduled(sender, currentType, newType, next);
+            return;
+        }
+        _upgradeNow(sender, currentType, newType, next, uint(delta));
+    }
+
+    /// @notice Call off a parked downgrade and stay on the current plan.
+    function cancelScheduledChange() external nonReentrant {
+        address sender = msg.sender;
+        uint pending = _pendingType[sender];
+        if (pending == 0) revert NoScheduledChange();
+        delete _pendingType[sender];
+        emit ScheduledChangeCancelled(sender, pending);
+    }
+
+    /// @notice What changeSubscription(newType) would do for `account` right now, so a front end
+    /// can say "pay 120.01 USDT now" or "switches on the 15th" before asking for a signature.
+    /// @return immediate Whether it takes effect now (true) or at the end of the paid-up period
+    /// @return chargedAmount USD * 10^USD_DECIMALS taken now; 0 for a trial swap or a downgrade
+    /// @return requiredTokenAmount `chargedAmount` in the account's pay token
+    /// @return effectiveAt When the new plan starts applying
+    function previewChange(address account, uint newType)
+        external
+        view
+        returns (bool immediate, uint chargedAmount, uint requiredTokenAmount, uint effectiveAt)
+    {
+        uint currentType = _activeType[account];
+        if (currentType == 0) revert NotSubscribed();
+        if (_cancelled[account]) revert AlreadyCancelled();
+        if (newType == currentType) revert SameSubscriptionType();
+        if (_subscriptionPrices[newType] == 0) revert InvalidSubscriptionType(newType);
+        if (_subscriptionPeriods[newType] == 0) revert UnknownPeriod();
+
+        if (block.timestamp < _trialEndsAt[account]) {
+            return (true, 0, 0, block.timestamp);
+        }
+        uint next = _nextChargeableAt[account][currentType];
+        if (block.timestamp >= next) revert SettleDebtFirst(next);
+
+        int delta = _changeDeltaUSD(account, currentType, newType, next);
+        if (delta <= 0) return (false, 0, 0, next);
+        chargedAmount = uint(delta);
+        return (
+            true,
+            chargedAmount,
+            _tokenAmountOf(_activePayToken[account], chargedAmount),
+            block.timestamp
+        );
     }
 
     function settleDebt() external nonReentrant {
@@ -585,6 +730,22 @@ contract Subscription is ReentrancyGuard {
 
     function isCancelled(address account) external view returns (bool) {
         return _cancelled[account];
+    }
+
+    /// @notice The plan `account` switches to when the paid-up period ends, or 0 if none.
+    function getPendingType(address account) external view returns (uint) {
+        return _pendingType[account];
+    }
+
+    /// @notice When `account`'s free trial ends. In the past (or 0) means not on trial.
+    function getTrialEndsAt(address account) external view returns (uint) {
+        return _trialEndsAt[account];
+    }
+
+    /// @notice Whether `account` is inside its free trial right now, i.e. whether a plan change
+    /// would be free.
+    function isInTrial(address account) external view returns (bool) {
+        return block.timestamp < _trialEndsAt[account];
     }
 
     /// @notice Whether restoreSubscription() would succeed for `account` right now.
@@ -881,6 +1042,9 @@ contract Subscription is ReentrancyGuard {
         uint32 period = _lockedPeriod[account];
         if (period == 0) revert UnknownPeriod();
         if (block.timestamp < next) revert NotDueYet(next);
+        // The paid-up period is over, so a parked downgrade lands now and everything charged
+        // below is already at the new plan.
+        (subscriptionType, period) = _applyPendingChange(account, subscriptionType, period);
         uint8 payToken = _activePayToken[account];
         // anchor-based accumulation: charge for every period elapsed since the anchor
         uint periodsCharged = (block.timestamp - next) / period + 1;
@@ -924,7 +1088,12 @@ contract Subscription is ReentrancyGuard {
             if (block.timestamp < previousNext) revert NotDueYet(previousNext);
             return;
         }
-        // Active: no direct plan switch — cancel first, then subscribe once the period ends.
+        // A parked downgrade would collide with the anchor bookkeeping below, and resubscribing
+        // is not how you resolve one — changeSubscription overwrites it, cancelScheduledChange
+        // drops it. Keeping this out also guarantees _activate never meets a pending change.
+        uint pending = _pendingType[account];
+        if (pending != 0) revert PendingChangeExists(pending);
+        // Active: no direct plan switch — changeSubscription handles upgrades and downgrades.
         if (previous != subscriptionType) revert MustCancelFirst(previous);
         // Same type: cannot pay ahead while the current period is still running.
         if (block.timestamp < previousNext) revert NotDueYet(previousNext);
@@ -944,6 +1113,9 @@ contract Subscription is ReentrancyGuard {
         // The account's own period, not the plan's current one — see _lockedPeriod.
         uint32 period = _lockedPeriod[account];
         if (period == 0) revert UnknownPeriod();
+        // Same as in _renew: the period being settled is over, so a parked downgrade lands
+        // first and the arrears are billed at the new plan.
+        (subscriptionType, period) = _applyPendingChange(account, subscriptionType, period);
         uint periodsCharged = (block.timestamp - next) / period + 1;
         _nextChargeableAt[account][subscriptionType] = next + periodsCharged * period;
         uint8 payToken = _activePayToken[account];
@@ -1011,7 +1183,9 @@ contract Subscription is ReentrancyGuard {
             // period follows the normal schedule off that same anchor — no special casing
             // anywhere in _renew/_settle. Cancelling before it lands stops the charge outright.
             _trialUsed[account][subscriptionType] = true;
-            _nextChargeableAt[account][subscriptionType] = block.timestamp + _trialPeriods[subscriptionType];
+            uint trialEndsAt = block.timestamp + _trialPeriods[subscriptionType];
+            _nextChargeableAt[account][subscriptionType] = trialEndsAt;
+            _trialEndsAt[account] = trialEndsAt;
             return true;
         }
         // Fresh start (first subscribe, post-terminate, or after a cancelled period elapsed):
@@ -1019,6 +1193,103 @@ contract Subscription is ReentrancyGuard {
         // by one period.
         _nextChargeableAt[account][subscriptionType] = next == 0 ? block.timestamp + period : next + period;
         return false;
+    }
+
+    /// @dev What moving from `currentType` to `newType` is worth in USD * 10^USD_DECIMALS,
+    /// positive when the caller owes money. Both plans are valued at their discounted price for
+    /// the caller's pay token, so a COAI payer pro-rates against what COAI payers actually pay.
+    /// Two shapes, picked by whether the new plan's length matches the one the account is on:
+    ///   same length  -> (newPrice - oldPrice) * remaining / period, the renewal date is kept
+    ///   different    -> newPrice - oldPrice * remaining / period, a whole new cycle is bought
+    ///                   and the old one's unused tail is credited against it
+    function _changeDeltaUSD(address account, uint currentType, uint newType, uint next)
+        private
+        view
+        returns (int)
+    {
+        uint8 payToken = _activePayToken[account];
+        uint32 period = _lockedPeriod[account];
+        uint remaining = next - block.timestamp; // caller guarantees next > block.timestamp
+        int oldPrice = int(_priceOf(currentType, payToken));
+        int newPrice = int(_priceOf(newType, payToken));
+        if (_subscriptionPeriods[newType] == period) {
+            return (newPrice - oldPrice) * int(remaining) / int(uint(period));
+        }
+        return newPrice - oldPrice * int(remaining) / int(uint(period));
+    }
+
+    /// @dev Swap the plan now and collect `chargedAmount`. A same-length change keeps the
+    /// renewal date; a different-length one restarts the cycle from now, which is what makes
+    /// the whole-cycle price charged by _changeDeltaUSD the right amount.
+    function _upgradeNow(address account, uint currentType, uint newType, uint next, uint chargedAmount) private {
+        uint8 payToken = _activePayToken[account];
+        uint requiredTokenAmount = _tokenAmountOf(payToken, chargedAmount);
+        uint32 newPeriod = _subscriptionPeriods[newType];
+        uint newNext = newPeriod == _lockedPeriod[account] ? next : block.timestamp + newPeriod;
+
+        delete _nextChargeableAt[account][currentType];
+        // Paying to move up supersedes any parked downgrade — it was decided against the plan
+        // the account is now leaving.
+        delete _pendingType[account];
+        _activeType[account] = newType;
+        _lockedPeriod[account] = newPeriod;
+        _nextChargeableAt[account][newType] = newNext;
+
+        emit SubscriptionUpgraded(account, currentType, newType, payToken, chargedAmount, requiredTokenAmount, newNext);
+        _collect(payToken, account, requiredTokenAmount);
+    }
+
+    /// @dev Free mid-trial swap. The trial keeps its end date, and the new plan's trial is burnt
+    /// too — otherwise the account could later cancel, let this one lapse, and claim a second
+    /// free trial on the plan it switched into.
+    function _switchDuringTrial(address account, uint currentType, uint newType) private {
+        uint trialEnd = _nextChargeableAt[account][currentType];
+        delete _nextChargeableAt[account][currentType];
+        delete _pendingType[account];
+        _activeType[account] = newType;
+        _nextChargeableAt[account][newType] = trialEnd;
+        // The first charge at trialEnd is a full period of the new plan, at its length.
+        _lockedPeriod[account] = _subscriptionPeriods[newType];
+        _trialUsed[account][newType] = true;
+        emit SubscriptionChangedDuringTrial(account, currentType, newType, trialEnd);
+    }
+
+    /// @dev Land a parked downgrade. Called from _renew/_settle once the paid-up period is over,
+    /// so the charge that follows is already at the new plan. The anchor moves across untouched
+    /// and the caller advances it with the returned period.
+    /// @dev Arrears are billed wholly at the new plan even when several periods have piled up.
+    /// The account asked to move down from `next` onward; a late fee collector should not make
+    /// that cost more.
+    function _applyPendingChange(address account, uint subscriptionType, uint32 period)
+        private
+        returns (uint, uint32)
+    {
+        uint pending = _pendingType[account];
+        if (pending == 0) return (subscriptionType, period);
+        uint32 newPeriod = _subscriptionPeriods[pending];
+        if (newPeriod == 0) revert UnknownPeriod();
+        uint next = _nextChargeableAt[account][subscriptionType];
+        delete _nextChargeableAt[account][subscriptionType];
+        delete _pendingType[account];
+        _activeType[account] = pending;
+        _lockedPeriod[account] = newPeriod;
+        _nextChargeableAt[account][pending] = next;
+        emit SubscriptionDowngraded(account, subscriptionType, pending, block.timestamp);
+        return (pending, newPeriod);
+    }
+
+    function _tokenAmountOf(uint8 payToken, uint rawAmount) private view returns (uint) {
+        if (payToken == PAY_TOKEN_USDT) return _calculateAmountUSDT(rawAmount);
+        if (payToken == PAY_TOKEN_COAI) return _calculateAmountCOAI(rawAmount);
+        if (payToken == PAY_TOKEN_USDC) return _calculateAmountUSDC(rawAmount);
+        revert UnknownPayToken(payToken);
+    }
+
+    function _collect(uint8 payToken, address from, uint amount) private {
+        if (payToken == PAY_TOKEN_USDT) _usdt.safeTransferFrom(from, _receiver, amount);
+        else if (payToken == PAY_TOKEN_COAI) _coai.safeTransferFrom(from, _receiver, amount);
+        else if (payToken == PAY_TOKEN_USDC) _usdc.safeTransferFrom(from, _receiver, amount);
+        else revert UnknownPayToken(payToken);
     }
 
     /// @dev Single source of truth for "does this subscribe open a trial instead of charging".
