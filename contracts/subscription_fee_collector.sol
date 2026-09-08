@@ -5,17 +5,15 @@ import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/governance/TimelockController.sol";
-import "@openzeppelin/contracts/utils/math/Math.sol";
 import "./lib/IPancakeV3PoolState.sol";
-import "./lib/TickMath.sol";
+import "./lib/CoaiTwapPricing.sol";
+import "./lib/UsdPricing.sol";
 
 contract Subscription is ReentrancyGuard {
     using SafeERC20 for ERC20;
-    error TWAPNotAvailable();
     error SwitchOff();
     error InvalidTwapInterval();
     error UnsupportedDecimals();
-    error CoaiNotInPool();
     error InvalidSubscriptionType(uint subscriptionType);
     error InvalidDiscount();
     error NotFeeCollector(address feeCollector, address caller);
@@ -261,7 +259,8 @@ contract Subscription is ReentrancyGuard {
     uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR     = 19188000000;     // $191.88 = $15.99 * 12
     uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR  = 96000000000;     // $960 = $80 * 12
     uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR      = 192000000000;    // $1920 = $160 * 12
-    uint constant DISCOUNT_BASE = 1000;
+    // Defined by UsdPricing; aliased so the many call sites below stay readable.
+    uint constant DISCOUNT_BASE = UsdPricing.DISCOUNT_BASE;
     uint constant DEFAULT_DISCOUNT_COAI = 700; // 30% off, applied only to COAI payments by default
     uint32 constant PERIOD_MONTH = 30 days;
     uint32 constant DEFAULT_TRIAL_PLUS_MONTH = 3 days;
@@ -271,8 +270,6 @@ contract Subscription is ReentrancyGuard {
     uint8 constant PAY_TOKEN_COAI = 2;
     uint8 constant PAY_TOKEN_USDC = 3;
 
-    // rawAmount uses Chainlink-style fixed-point USD: USD * 1e8 (e.g. $19.99 -> 1_999_000_000)
-    uint8 constant USD_DECIMALS = 8;
     uint32 constant TWAP_INTERVAL = 1800; // 30 minutes
     address constant DEFAULT_PANCAKE_COAI_POOL = 0xbc0E5A205D729299D93973d634E2507CD8b625A3;
     address constant DEFAULT_USDT = 0x55d398326f99059fF775485246999027B3197955;
@@ -301,7 +298,7 @@ contract Subscription is ReentrancyGuard {
         _usdc = ERC20(DEFAULT_USDC);
         _usdcDecimals = ERC20(DEFAULT_USDC).decimals();
         _coaiPriceFeed = IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL);
-        _coaiIsToken0 = _resolveCoaiIsToken0(IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL), DEFAULT_COAI);
+        _coaiIsToken0 = CoaiTwapPricing.resolveCoaiIsToken0(IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL), DEFAULT_COAI);
         _receiver = receiver;
         TimelockController timelock = new TimelockController(minDelay, proposers, executors, admin);
         _owner = address(timelock);
@@ -639,7 +636,7 @@ contract Subscription is ReentrancyGuard {
     }
 
     function getCoaiTwapHealth() external view returns (bool) {
-        return _isCoaiTwapHealthy();
+        return CoaiTwapPricing.isHealthy(_coaiPriceFeed, _twapInterval);
     }
 
     function getUSDTAddress() external view returns (address) {
@@ -692,7 +689,7 @@ contract Subscription is ReentrancyGuard {
         _coai = ERC20(new_coaiAddress);
         _coaiDecimals = dec;
         _coaiPriceFeed = IPancakeV3PoolState(new_coaiPriceFeedAddress);
-        _coaiIsToken0 = _resolveCoaiIsToken0(_coaiPriceFeed, new_coaiAddress);
+        _coaiIsToken0 = CoaiTwapPricing.resolveCoaiIsToken0(_coaiPriceFeed, new_coaiAddress);
         emit COAIAddressChanged(new_coaiAddress, dec);
         emit COAIPriceFeedAddressChanged(new_coaiPriceFeedAddress);
     }
@@ -704,7 +701,7 @@ contract Subscription is ReentrancyGuard {
     function setCOAIPriceFeedAddress(address new_coaiPriceFeedAddress) onlyOwner external {
         if (new_coaiPriceFeedAddress == address(0)) revert ZeroAddress();
         _coaiPriceFeed = IPancakeV3PoolState(new_coaiPriceFeedAddress);
-        _coaiIsToken0 = _resolveCoaiIsToken0(IPancakeV3PoolState(new_coaiPriceFeedAddress), address(_coai));
+        _coaiIsToken0 = CoaiTwapPricing.resolveCoaiIsToken0(IPancakeV3PoolState(new_coaiPriceFeedAddress), address(_coai));
         emit COAIPriceFeedAddressChanged(new_coaiPriceFeedAddress);
     }
 
@@ -1007,102 +1004,21 @@ contract Subscription is ReentrancyGuard {
     }
 
     function _calculateAmountUSDT(uint rawAmount) private view returns (uint) {
-        // rawAmount in USD * 10^USD_DECIMALS -> token amount in USDT wei (USDT pegged 1:1 to USD)
-        return rawAmount * (10 ** _usdtDecimals) / (10 ** USD_DECIMALS);
+        return UsdPricing.toStableAmount(rawAmount, _usdtDecimals);
     }
 
     function _calculateAmountUSDC(uint rawAmount) private view returns (uint) {
-        // rawAmount in USD * 10^USD_DECIMALS -> token amount in USDC wei (USDC pegged 1:1 to USD)
-        return rawAmount * (10 ** _usdcDecimals) / (10 ** USD_DECIMALS);
+        return UsdPricing.toStableAmount(rawAmount, _usdcDecimals);
     }
 
     function _calculateAmountCOAI(uint rawAmount) private view returns (uint) {
-        // PancakeV3 pool with COAI paired against a USD-stable quote (both 18 decimals; COAI enforced).
-        // sqrtPriceX96 = sqrt(token1_wei / token0_wei) * 2^96. We compute the COAI amount in wei
-        // using Math.mulDiv (512-bit intermediates) so this works across the full price range
-        // without overflow (extreme-price token1 path) or silent truncation-to-zero (very small
-        // sqrtPriceX96). Same precision/safety pattern as Uniswap V3 OracleLibrary.getQuoteAtTick.
-        uint160 sqrtPriceX96 = _getCoaiTwapSqrtPriceX96();
-        if (sqrtPriceX96 == 0) revert TWAPNotAvailable();
-
-        // baseAmount = quote-token wei equivalent of rawAmount USD (assumes 18-dec USD-stable quote).
-        uint baseAmount = rawAmount * (10 ** (_coaiDecimals - USD_DECIMALS));
-
-        // COAI is token0  =>  USDT is token1  =>  coaiAmount = baseAmount / (token1/token0)
-        // COAI is token1  =>  USDT is token0  =>  coaiAmount = baseAmount * (token1/token0)
-        if (sqrtPriceX96 <= type(uint128).max) {
-            // Square fits in uint256 directly (Q192 ratio).
-            uint ratioX192 = uint(sqrtPriceX96) * sqrtPriceX96;
-            return _coaiIsToken0
-                ? Math.mulDiv(1 << 192, baseAmount, ratioX192)
-                : Math.mulDiv(ratioX192, baseAmount, 1 << 192);
-        } else {
-            // sqrtPriceX96^2 would overflow uint256; scale down by 2^64 first (Q128 ratio).
-            uint ratioX128 = Math.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 64);
-            return _coaiIsToken0
-                ? Math.mulDiv(1 << 128, baseAmount, ratioX128)
-                : Math.mulDiv(ratioX128, baseAmount, 1 << 128);
-        }
+        return CoaiTwapPricing.toCoaiAmount(_coaiPriceFeed, _twapInterval, _coaiIsToken0, _coaiDecimals, rawAmount);
     }
 
     function _priceOf(uint subscriptionType, uint8 payToken) private view returns (uint) {
         uint price = _subscriptionPrices[subscriptionType];
         if (price == 0) revert InvalidSubscriptionType(subscriptionType);
-        return price * _discounts[payToken] / DISCOUNT_BASE;
+        return UsdPricing.applyDiscount(price, _discounts[payToken]);
     }
 
-    function _resolveCoaiIsToken0(IPancakeV3PoolState pool, address coai) private view returns (bool) {
-        address t0 = pool.token0();
-        if (t0 == coai) return true;
-        if (pool.token1() == coai) return false;
-        revert CoaiNotInPool();
-    }
-
-    function _getCoaiTwapSqrtPriceX96() private view returns (uint160) {
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = _twapInterval;
-        secondsAgos[1] = 0;
-        try _coaiPriceFeed.observe(secondsAgos) returns (
-            int56[] memory tickCumulatives,
-            uint160[] memory
-        ) {
-            // Promote to int256 before subtracting so the diff cannot overflow int56 as
-            // pool cumulatives drift toward their bounds over years of accumulation.
-            int256 tickDelta = int256(tickCumulatives[1]) - int256(tickCumulatives[0]);
-            int256 interval = int256(uint256(_twapInterval));
-            int256 rawAvgTick = tickDelta / interval;
-            // First bound to int24 range so the narrowing cast below is lossless.
-            if (rawAvgTick < int256(TickMath.MIN_TICK) || rawAvgTick > int256(TickMath.MAX_TICK)) revert TWAPNotAvailable();
-            int24 avgTick = int24(rawAvgTick);
-            if (tickDelta < 0 && (tickDelta % interval != 0)) avgTick--;
-            // Re-check AFTER the floor correction. At the lower boundary the decrement
-            // can push avgTick to MIN_TICK-1, which would make getSqrtRatioAtTick revert
-            // with TickOutOfRange — and that revert sits inside the try-success block, so
-            // it would NOT be caught by `catch` below and would leak out instead of the
-            // intended TWAPNotAvailable. Mirrors the final clamp in _isCoaiTwapHealthy.
-            if (avgTick < TickMath.MIN_TICK || avgTick > TickMath.MAX_TICK) revert TWAPNotAvailable();
-            return TickMath.getSqrtRatioAtTick(avgTick);
-        } catch {
-            revert TWAPNotAvailable();
-        }
-    }
-
-    function _isCoaiTwapHealthy() private view returns (bool) {
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = _twapInterval;
-        secondsAgos[1] = 0;
-        try _coaiPriceFeed.observe(secondsAgos) returns (int56[] memory tickCumulatives, uint160[] memory) {
-            int256 tickDelta = int256(tickCumulatives[1]) - int256(tickCumulatives[0]);
-            int256 interval = int256(uint256(_twapInterval));
-            int256 rawAvgTick = tickDelta / interval;
-            if (rawAvgTick < int256(TickMath.MIN_TICK) || rawAvgTick > int256(TickMath.MAX_TICK)) return false;
-            int24 avgTick = int24(rawAvgTick);
-            // Same floor correction as _getCoaiTwapSqrtPriceX96; without it the health check
-            // can return true while the price path reverts (avgTick falls below MIN_TICK).
-            if (tickDelta < 0 && (tickDelta % interval != 0)) avgTick--;
-            return avgTick >= TickMath.MIN_TICK && avgTick <= TickMath.MAX_TICK;
-        } catch {
-            return false;
-        }
-    }
 }
