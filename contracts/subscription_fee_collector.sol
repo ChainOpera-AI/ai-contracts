@@ -261,7 +261,7 @@ contract Subscription is ReentrancyGuard {
     uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR      = 192000000000;    // $1920 = $160 * 12
     // Defined by UsdPricing; aliased so the many call sites below stay readable.
     uint constant DISCOUNT_BASE = UsdPricing.DISCOUNT_BASE;
-    uint constant DEFAULT_DISCOUNT_COAI = 700; // 30% off, applied only to COAI payments by default
+    uint constant DEFAULT_DISCOUNT_COAI = 900; // 10% off, applied only to COAI payments by default
     uint32 constant PERIOD_MONTH = 30 days;
     uint32 constant DEFAULT_TRIAL_PLUS_MONTH = 3 days;
     uint32 constant PERIOD_YEAR = 365 days;

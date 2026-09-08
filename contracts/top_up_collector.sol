@@ -117,7 +117,7 @@ contract TopUp is ReentrancyGuard {
     uint constant DEFAULT_TOP_UP_AMOUNT = 1000000000; // $10
     // Defined by UsdPricing; aliased so the many call sites below stay readable.
     uint constant DISCOUNT_BASE = UsdPricing.DISCOUNT_BASE;
-    uint constant DEFAULT_DISCOUNT_COAI = 700; // 30% off, applied only to COAI payments by default
+    uint constant DEFAULT_DISCOUNT_COAI = 900; // 10% off, applied only to COAI payments by default
     // PAY_TOKEN_USDT/COAI/USDC values are stable identifiers; 0 is reserved for "unset".
     uint8 constant PAY_TOKEN_USDT = 1;
     uint8 constant PAY_TOKEN_COAI = 2;
