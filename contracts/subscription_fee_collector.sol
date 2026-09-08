@@ -144,6 +144,20 @@ contract Subscription is ReentrancyGuard {
         uint indexed subscriptionType,
         uint restoredAt
     );
+    /// @dev Emitted instead of SubscribedUSDT/COAI/USDC when a subscribe starts a free trial:
+    /// nothing is transferred, so no SubscribedXXX is emitted and revenue accounting stays clean.
+    /// The first real charge lands at `trialEndsAt` via the fee collector's renew.
+    event TrialStarted(
+        address indexed account,
+        uint indexed subscriptionType,
+        address indexed inviter,
+        uint8 payToken,
+        uint trialEndsAt
+    );
+    event TrialPeriodChanged(
+        uint indexed subscriptionType,
+        uint32 new_trialSeconds
+    );
     event DebtSettled(
         address indexed account,
         uint indexed subscriptionType,
@@ -213,6 +227,15 @@ contract Subscription is ReentrancyGuard {
     // good and only a fresh subscribeXXX brings it back. The stale _activeType is deliberately
     // left behind — getEffectiveType() is what reports real entitlement.
     mapping(address => bool) private _cancelled;
+    // subscriptionType => free trial length in seconds (0 = no trial, charge on subscribe).
+    // Set per type by the owner, so any plan can be given a trial — or have it withdrawn —
+    // at any time without touching code.
+    mapping(uint => uint32) private _trialPeriods;
+    // user => subscriptionType => trial already consumed. One trial per account per type,
+    // forever: without this a user could trial, cancel before the charge, let the trial run
+    // out and subscribe again for another free ride. Deliberately NOT cleared by
+    // terminateSubscription — being force-cancelled does not earn a new trial.
+    mapping(address => mapping(uint => bool)) private _trialUsed;
     // user => inviter (referrer) address. Required (non-zero) on every subscribeXXX call;
     // each successful subscribe overwrites the stored value, so users can switch their referrer
     // on a later call. Subscribers cannot invite themselves. Persists across cancel/terminate.
@@ -241,6 +264,7 @@ contract Subscription is ReentrancyGuard {
     uint constant DISCOUNT_BASE = 1000;
     uint constant DEFAULT_DISCOUNT_COAI = 700; // 30% off, applied only to COAI payments by default
     uint32 constant PERIOD_MONTH = 30 days;
+    uint32 constant DEFAULT_TRIAL_PLUS_MONTH = 3 days;
     uint32 constant PERIOD_YEAR = 365 days;
     // PAY_TOKEN_USDT/COAI/USDC values are stable identifiers; 0 reserved for "unset/never subscribed".
     uint8 constant PAY_TOKEN_USDT = 1;
@@ -321,6 +345,8 @@ contract Subscription is ReentrancyGuard {
         emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_YEAR,     PERIOD_YEAR);
         emit SubscriptionPeriodChanged(SUB_TYPE_PREMIUM_YEAR,  PERIOD_YEAR);
         emit SubscriptionPeriodChanged(SUB_TYPE_PRO_YEAR,      PERIOD_YEAR);
+        _trialPeriods[SUB_TYPE_PLUS_MONTH] = DEFAULT_TRIAL_PLUS_MONTH;
+        emit TrialPeriodChanged(SUB_TYPE_PLUS_MONTH, DEFAULT_TRIAL_PLUS_MONTH);
         _subscriptionListed[SUB_TYPE_GO_MONTH]      = true;
         _subscriptionListed[SUB_TYPE_PLUS_MONTH]    = true;
         _subscriptionListed[SUB_TYPE_PREMIUM_MONTH] = true;
@@ -481,6 +507,31 @@ contract Subscription is ReentrancyGuard {
         if (periodSeconds == 0) revert UnknownPeriod();
         _subscriptionPeriods[subscriptionType] = periodSeconds;
         emit SubscriptionPeriodChanged(subscriptionType, periodSeconds);
+    }
+
+    function getTrialPeriod(uint subscriptionType) external view returns (uint32) {
+        return _trialPeriods[subscriptionType];
+    }
+
+    /// @notice Give `subscriptionType` a free trial of `trialSeconds`, or pass 0 to withdraw
+    /// it. Affects new subscribes only — trials already running keep their anchor.
+    /// @dev No upper bound on purpose: the trial length is whatever the owner (the timelock)
+    /// decides, including longer than the plan's own period. It defers the first charge to
+    /// now + trialSeconds; the billing schedule then runs off that anchor as usual.
+    function setTrialPeriod(uint subscriptionType, uint32 trialSeconds) onlyOwner external {
+        if (subscriptionType == 0) revert InvalidSubscriptionType(0);
+        _trialPeriods[subscriptionType] = trialSeconds;
+        emit TrialPeriodChanged(subscriptionType, trialSeconds);
+    }
+
+    function isTrialUsed(address account, uint subscriptionType) external view returns (bool) {
+        return _trialUsed[account][subscriptionType];
+    }
+
+    /// @notice Whether a subscribe by `account` for `subscriptionType` right now would open a
+    /// free trial rather than charge immediately. Front ends use this to pick the button.
+    function startsTrial(address account, uint subscriptionType) external view returns (bool) {
+        return _startsTrial(account, subscriptionType);
     }
 
     function isListed(uint subscriptionType) external view returns (bool) {
@@ -739,6 +790,14 @@ contract Subscription is ReentrancyGuard {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
         _recordInviter(sender, inviter);
+        // Trial checked before pricing: a trial must not depend on a live quote (the COAI
+        // path would revert on a stale TWAP) and nothing is charged, so there is no price
+        // to compute.
+        if (_startsTrial(sender, subscriptionType)) {
+            _activate(sender, subscriptionType, PAY_TOKEN_USDT);
+            emit TrialStarted(sender, subscriptionType, inviter, PAY_TOKEN_USDT, _nextChargeableAt[sender][subscriptionType]);
+            return;
+        }
         uint price = _priceOf(subscriptionType, PAY_TOKEN_USDT);
         uint requiredUSDTAmount = _calculateAmountUSDT(price);
         _activate(sender, subscriptionType, PAY_TOKEN_USDT);
@@ -750,6 +809,14 @@ contract Subscription is ReentrancyGuard {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
         _recordInviter(sender, inviter);
+        // Trial checked before pricing: a trial must not depend on a live quote (the COAI
+        // path would revert on a stale TWAP) and nothing is charged, so there is no price
+        // to compute.
+        if (_startsTrial(sender, subscriptionType)) {
+            _activate(sender, subscriptionType, PAY_TOKEN_COAI);
+            emit TrialStarted(sender, subscriptionType, inviter, PAY_TOKEN_COAI, _nextChargeableAt[sender][subscriptionType]);
+            return;
+        }
         uint price = _priceOf(subscriptionType, PAY_TOKEN_COAI);
         uint requiredCOAIAmount = _calculateAmountCOAI(price);
         _activate(sender, subscriptionType, PAY_TOKEN_COAI);
@@ -761,6 +828,14 @@ contract Subscription is ReentrancyGuard {
         address sender = msg.sender;
         _requireDue(sender, subscriptionType);
         _recordInviter(sender, inviter);
+        // Trial checked before pricing: a trial must not depend on a live quote (the COAI
+        // path would revert on a stale TWAP) and nothing is charged, so there is no price
+        // to compute.
+        if (_startsTrial(sender, subscriptionType)) {
+            _activate(sender, subscriptionType, PAY_TOKEN_USDC);
+            emit TrialStarted(sender, subscriptionType, inviter, PAY_TOKEN_USDC, _nextChargeableAt[sender][subscriptionType]);
+            return;
+        }
         uint price = _priceOf(subscriptionType, PAY_TOKEN_USDC);
         uint requiredUSDCAmount = _calculateAmountUSDC(price);
         _activate(sender, subscriptionType, PAY_TOKEN_USDC);
@@ -872,7 +947,12 @@ contract Subscription is ReentrancyGuard {
         }
     }
 
-    function _activate(address account, uint subscriptionType, uint8 payToken) private {
+    /// @return trialStarted True when this subscribe opened a free trial and therefore
+    /// charged nothing — the caller must skip its transfer and emit TrialStarted instead.
+    function _activate(address account, uint subscriptionType, uint8 payToken) private returns (bool trialStarted) {
+        // Must be read BEFORE the cancelled-account cleanup below, which clears the very
+        // state _startsTrial inspects.
+        trialStarted = _startsTrial(account, subscriptionType);
         uint previous = _activeType[account];
         if (previous != 0) {
             if (_cancelled[account]) {
@@ -895,12 +975,35 @@ contract Subscription is ReentrancyGuard {
         }
         _activeType[account] = subscriptionType;
         _activePayToken[account] = payToken;
+        if (trialStarted) {
+            // Free trial: nothing is charged now. Anchoring at the trial's end means the fee
+            // collector's renew at that moment takes the first full period, and every later
+            // period follows the normal schedule off that same anchor — no special casing
+            // anywhere in _renew/_settle. Cancelling before it lands stops the charge outright.
+            _trialUsed[account][subscriptionType] = true;
+            _nextChargeableAt[account][subscriptionType] = block.timestamp + _trialPeriods[subscriptionType];
+            return true;
+        }
         uint32 period = _subscriptionPeriods[subscriptionType];
         uint next = _nextChargeableAt[account][subscriptionType];
         // Fresh start (first subscribe, post-terminate, or after a cancelled period elapsed):
         // anchor at now + period. Existing anchor (same-type resubscribe once due): advance
         // by one period.
         _nextChargeableAt[account][subscriptionType] = next == 0 ? block.timestamp + period : next + period;
+        return false;
+    }
+
+    /// @dev Single source of truth for "does this subscribe open a trial instead of charging".
+    /// Called both by the subscribeXXX paths (to skip pricing and the transfer) and by
+    /// _activate (to set the anchor), so the two can never disagree.
+    function _startsTrial(address account, uint subscriptionType) private view returns (bool) {
+        if (_trialPeriods[subscriptionType] == 0) return false;
+        if (_trialUsed[account][subscriptionType]) return false;
+        // Only a fresh start gets a trial, never a renewal of a subscription already running:
+        // either the account has no anchor on this type, or it is a cancelled-and-elapsed one
+        // whose anchors _activate is about to drop. Without this, an account that paid for a
+        // plan before a trial was configured would be handed a free period on resubscribe.
+        return _cancelled[account] || _nextChargeableAt[account][subscriptionType] == 0;
     }
 
     function _calculateAmountUSDT(uint rawAmount) private view returns (uint) {
