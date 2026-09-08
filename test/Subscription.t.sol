@@ -48,6 +48,11 @@ contract SubscriptionTest {
     function _bal(address a) private view returns (uint) { return MockERC20(USDT).balanceOf(a); }
     function _sub(address who, uint t) private { vm.prank(who); sub.subscriptionUSDT(t, address(0)); }
     function _assert(bool ok, string memory what) private pure { require(ok, what); }
+    function _fund(address who) private {
+        MockERC20(USDT).mint(who, 1_000_000e18);
+        vm.prank(who);
+        MockERC20(USDT).approve(address(sub), type(uint).max);
+    }
 
     // --- the requested behaviour -------------------------------------------
 
@@ -204,5 +209,70 @@ contract SubscriptionTest {
         _sub(alice, GO_MONTH);
         _assert(before - _bal(alice) == GO_PRICE, "only one period, gap not billed");
         _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "anchor restarts at now");
+    }
+
+    // --- setSubscriptionPeriod only ever affects new subscriptions ----------
+
+    function test_PeriodChangeLeavesExistingSubscribersOnTheirOwnCadence() public {
+        _sub(alice, GO_MONTH);
+        uint t0 = block.timestamp;
+        _assert(sub.getLockedPeriod(alice) == PERIOD, "locked at 30d");
+
+        vm.prank(timelock);
+        sub.setSubscriptionPeriod(GO_MONTH, 7 days);
+        _assert(sub.getSubscriptionPeriod(GO_MONTH) == 7 days, "plan is now weekly");
+        _assert(sub.getLockedPeriod(alice) == PERIOD, "alice keeps 30d");
+
+        // her renewals keep stepping by 30d, not 7d
+        vm.warp(t0 + PERIOD);
+        vm.prank(feeCollector);
+        sub.renew(alice);
+        _assert(sub.nextChargeableAt(alice) == t0 + 2 * PERIOD, "still stepping by 30d");
+    }
+
+    function test_PeriodChangeAppliesToNewSubscribers() public {
+        _sub(alice, GO_MONTH);
+        vm.prank(timelock);
+        sub.setSubscriptionPeriod(GO_MONTH, 7 days);
+
+        address bob = address(0xB0B);
+        _fund(bob);
+        _sub(bob, GO_MONTH);
+        _assert(sub.getLockedPeriod(bob) == 7 days, "bob locked at the new 7d");
+        _assert(sub.nextChargeableAt(bob) == block.timestamp + 7 days, "bob renews in 7d");
+        _assert(sub.getLockedPeriod(alice) == PERIOD, "alice untouched");
+    }
+
+    /// The regression this whole mechanism exists for: shortening a plan must not re-slice
+    /// arrears that accrued while the old period was in force.
+    function test_ShorteningPeriodCannotInflateExistingArrears() public {
+        _sub(alice, GO_MONTH);
+        uint t0 = block.timestamp;
+        uint paid = _bal(receiver);
+
+        // fee collector is 60 days late, and the owner shortens the plan before the catch-up
+        vm.warp(t0 + PERIOD + 60 days);
+        vm.prank(timelock);
+        sub.setSubscriptionPeriod(GO_MONTH, 10 days);
+
+        vm.prank(feeCollector);
+        sub.renew(alice);
+        // 60 days of arrears at her locked 30d period => 3 periods.
+        // Sliced at the new 10d period it would have been 7.
+        _assert((_bal(receiver) - paid) / GO_PRICE == 3, "arrears billed at the locked period");
+    }
+
+    function test_ResubscribeAfterCancelAdoptsTheNewPeriod() public {
+        _sub(alice, GO_MONTH);
+        vm.prank(timelock);
+        sub.setSubscriptionPeriod(GO_MONTH, 7 days);
+
+        vm.prank(alice);
+        sub.cancelSubscription();
+        vm.warp(sub.nextChargeableAt(alice)); // let the paid-up period run out
+        _sub(alice, GO_MONTH);
+
+        _assert(sub.getLockedPeriod(alice) == 7 days, "fresh start picks up the new period");
+        _assert(sub.nextChargeableAt(alice) == block.timestamp + 7 days, "and anchors on it");
     }
 }

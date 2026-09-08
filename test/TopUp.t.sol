@@ -14,7 +14,7 @@ contract TopUpTest {
 
     uint constant TEN_USD = 1000000000;        // $10 at USD*1e8
     uint constant TEN_IN_TOKEN = 10e18;        // $10 in an 18-dec stable
-    uint constant SEVEN_IN_COAI = 7e18;        // $10 * 0.7 discount, at 1 COAI = $1
+    uint constant NINE_IN_COAI = 9e18;         // $10 * 0.9 discount, at 1 COAI = $1
 
     TopUp t;
     address timelock;
@@ -60,11 +60,11 @@ contract TopUpTest {
     }
 
     function test_TopUpCOAIAppliesTheDiscount() public {
-        _assert(t.getDiscount(2) == 700, "COAI is 30% off by default");
-        _assert(t.getTopUpAmountCOAI() == SEVEN_IN_COAI, "quote is $7 worth of COAI");
+        _assert(t.getDiscount(2) == 900, "COAI is 10% off by default");
+        _assert(t.getTopUpAmountCOAI() == NINE_IN_COAI, "quote is $9 worth of COAI");
         vm.prank(alice);
         t.topUpCOAI();
-        _assert(_bal(COAI, receiver) == SEVEN_IN_COAI, "receiver got the discounted COAI");
+        _assert(_bal(COAI, receiver) == NINE_IN_COAI, "receiver got the discounted COAI");
         _assert(t.getTotalToppedUp(alice) == TEN_USD, "still credits the full $10 face value");
     }
 

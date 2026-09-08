@@ -218,6 +218,12 @@ contract Subscription is ReentrancyGuard {
     mapping(address => uint) private _activeType;
     // user => payToken used at last subscribe (PAY_TOKEN_USDT / _COAI / _USDC). Determines renew currency.
     mapping(address => uint8) private _activePayToken;
+    // user => the billing period, in seconds, snapshotted when they subscribed. Every charge is
+    // sliced with THIS value, never with the plan's live _subscriptionPeriods. Two reasons:
+    // the account keeps the cadence it agreed to, and — more importantly — a mid-flight
+    // setSubscriptionPeriod can never retroactively re-slice arrears that accrued under the old
+    // period (shortening the period would otherwise multiply an outstanding debt).
+    mapping(address => uint32) private _lockedPeriod;
     // user => cancelled flag. Cancelling does NOT tear the subscription down: the account keeps
     // _activeType / _activePayToken / _nextChargeableAt and coasts on the period it already paid
     // for, while renewals stop. Inside that window restoreSubscription() clears the flag and the
@@ -421,6 +427,7 @@ contract Subscription is ReentrancyGuard {
         delete _nextChargeableAt[account][subscriptionType];
         delete _activeType[account];
         delete _activePayToken[account];
+        delete _lockedPeriod[account];
         delete _cancelled[account];
         emit SubscriptionTerminated(account, subscriptionType, msg.sender, block.timestamp);
     }
@@ -496,10 +503,15 @@ contract Subscription is ReentrancyGuard {
         return _subscriptionPeriods[subscriptionType];
     }
 
+    /// @notice Set a plan's billing period. Applies to NEW subscriptions only: accounts already
+    /// subscribed keep the period they locked in at subscribe time (getLockedPeriod), and only
+    /// pick up the new one by cancelling and subscribing again. Note that price and period are
+    /// independent — halving the period without halving the price doubles what a new subscriber
+    /// pays per unit time.
     function setSubscriptionPeriod(uint subscriptionType, uint32 periodSeconds) onlyOwner external {
         // type 0 is the "unset / never subscribed" sentinel in _activeType.
-        // Zero period would brick renew/settle/_requireDue for existing subscribers — use
-        // delistSubscription to stop new sign-ups instead.
+        // Zero period would brick new subscribes on this type — use delistSubscription to stop
+        // sign-ups instead.
         if (subscriptionType == 0) revert InvalidSubscriptionType(0);
         if (periodSeconds == 0) revert UnknownPeriod();
         _subscriptionPeriods[subscriptionType] = periodSeconds;
@@ -585,6 +597,14 @@ contract Subscription is ReentrancyGuard {
 
     function getActivePayToken(address account) external view returns (uint8) {
         return _activePayToken[account];
+    }
+
+    /// @notice The billing period `account` is locked into, in seconds: the plan's period as it
+    /// stood when they subscribed. setSubscriptionPeriod does not affect it — compare against
+    /// getSubscriptionPeriod to see whether an account is on an outdated cadence. 0 if the
+    /// account has never subscribed.
+    function getLockedPeriod(address account) external view returns (uint32) {
+        return _lockedPeriod[account];
     }
 
     function getInviter(address account) external view returns (address) {
@@ -857,7 +877,8 @@ contract Subscription is ReentrancyGuard {
         if (_cancelled[account]) revert AlreadyCancelled();
         uint next = _nextChargeableAt[account][subscriptionType];
         if (next == 0) revert NotSubscribed();
-        uint32 period = _subscriptionPeriods[subscriptionType];
+        // The account's own period, not the plan's current one — see _lockedPeriod.
+        uint32 period = _lockedPeriod[account];
         if (period == 0) revert UnknownPeriod();
         if (block.timestamp < next) revert NotDueYet(next);
         uint8 payToken = _activePayToken[account];
@@ -920,7 +941,8 @@ contract Subscription is ReentrancyGuard {
         // Caller MUST have verified _nextChargeableAt[account][subscriptionType] != 0
         // AND block.timestamp >= that value (i.e. debt exists).
         uint next = _nextChargeableAt[account][subscriptionType];
-        uint32 period = _subscriptionPeriods[subscriptionType];
+        // The account's own period, not the plan's current one — see _lockedPeriod.
+        uint32 period = _lockedPeriod[account];
         if (period == 0) revert UnknownPeriod();
         uint periodsCharged = (block.timestamp - next) / period + 1;
         _nextChargeableAt[account][subscriptionType] = next + periodsCharged * period;
@@ -972,6 +994,17 @@ contract Subscription is ReentrancyGuard {
         }
         _activeType[account] = subscriptionType;
         _activePayToken[account] = payToken;
+        uint next = _nextChargeableAt[account][subscriptionType];
+        // A fresh start adopts whatever the plan's period is right now and locks it in for the
+        // life of this subscription. A resubscribe onto a running anchor keeps the period the
+        // account already holds, so the two can never be mixed when advancing the anchor.
+        uint32 period;
+        if (next == 0) {
+            period = _subscriptionPeriods[subscriptionType];
+            _lockedPeriod[account] = period;
+        } else {
+            period = _lockedPeriod[account];
+        }
         if (trialStarted) {
             // Free trial: nothing is charged now. Anchoring at the trial's end means the fee
             // collector's renew at that moment takes the first full period, and every later
@@ -981,8 +1014,6 @@ contract Subscription is ReentrancyGuard {
             _nextChargeableAt[account][subscriptionType] = block.timestamp + _trialPeriods[subscriptionType];
             return true;
         }
-        uint32 period = _subscriptionPeriods[subscriptionType];
-        uint next = _nextChargeableAt[account][subscriptionType];
         // Fresh start (first subscribe, post-terminate, or after a cancelled period elapsed):
         // anchor at now + period. Existing anchor (same-type resubscribe once due): advance
         // by one period.
