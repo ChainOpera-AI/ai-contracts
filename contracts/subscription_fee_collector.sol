@@ -175,12 +175,17 @@ contract Subscription is ReentrancyGuard {
         uint indexed new_subscriptionType,
         uint downgradedAt
     );
-    /// @dev Plan swapped mid-trial: free, and the trial keeps its original end date.
-    event SubscriptionChangedDuringTrial(
+    /// @dev Plan swapped mid-trial for one that carries no trial of its own. The trial belonged
+    /// to the plan being left, so it ends there and then and the account is charged a full
+    /// period of the new plan up front.
+    event TrialEndedByChange(
         address indexed account,
         uint indexed previous_subscriptionType,
         uint indexed new_subscriptionType,
-        uint trialEndsAt
+        uint8 payToken,
+        uint chargedAmount,
+        uint requiredTokenAmount,
+        uint nextChargeableAt
     );
     /// @dev Emitted instead of SubscribedUSDT/COAI/USDC when a subscribe starts a free trial:
     /// nothing is transferred, so no SubscribedXXX is emitted and revenue accounting stays clean.
@@ -275,11 +280,13 @@ contract Subscription is ReentrancyGuard {
     // Set per type by the owner, so any plan can be given a trial — or have it withdrawn —
     // at any time without touching code.
     mapping(uint => uint32) private _trialPeriods;
-    // user => subscriptionType => trial already consumed. One trial per account per type,
-    // forever: without this a user could trial, cancel before the charge, let the trial run
-    // out and subscribe again for another free ride. Deliberately NOT cleared by
-    // terminateSubscription — being force-cancelled does not earn a new trial.
-    mapping(address => mapping(uint => bool)) private _trialUsed;
+    // user => has ever held a subscription. The free trial is strictly a first-subscription
+    // offer: once an account has subscribed to anything — trial or paid — it can never trial
+    // again, on any plan. That makes this one flag the whole eligibility rule, and it is why
+    // changing plans can never open a trial (the account has subscribed by definition).
+    // Deliberately NOT cleared by terminateSubscription: being force-cancelled does not earn
+    // a fresh trial.
+    mapping(address => bool) private _everSubscribed;
     // user => the single pending end-of-period change, if any (0 = none). Holds the plan to
     // move to when the paid-up period runs out. Mutually exclusive with _cancelled: both mean
     // "something happens at the end of this period" and an account only ever has one such slot.
@@ -546,10 +553,12 @@ contract Subscription is ReentrancyGuard {
         if (_subscriptionPeriods[newType] == 0) revert UnknownPeriod();
         if (!_subscriptionListed[newType]) revert NotListed(newType);
 
-        // Mid-trial: nothing has been paid yet, so there is no remaining value to protect and
-        // nothing to pro-rate. Swap the plan, keep the trial running to its original end.
+        // Mid-trial: the trial is a one-off offer tied to the account's first subscription, so
+        // moving off that plan ends it, whatever the destination. Nothing was ever paid, so
+        // there is no remaining value to pro-rate — a full period of the new plan is charged
+        // now. Holds in both directions, cheaper plans included.
         if (block.timestamp < _trialEndsAt[sender]) {
-            _switchDuringTrial(sender, currentType, newType);
+            _endTrialWithChange(sender, currentType, newType);
             return;
         }
 
@@ -579,7 +588,7 @@ contract Subscription is ReentrancyGuard {
     /// @notice What changeSubscription(newType) would do for `account` right now, so a front end
     /// can say "pay 120.01 USDT now" or "switches on the 15th" before asking for a signature.
     /// @return immediate Whether it takes effect now (true) or at the end of the paid-up period
-    /// @return chargedAmount USD * 10^USD_DECIMALS taken now; 0 for a trial swap or a downgrade
+    /// @return chargedAmount USD * 10^USD_DECIMALS taken now; 0 when the change is parked
     /// @return requiredTokenAmount `chargedAmount` in the account's pay token
     /// @return effectiveAt When the new plan starts applying
     function previewChange(address account, uint newType)
@@ -595,7 +604,14 @@ contract Subscription is ReentrancyGuard {
         if (_subscriptionPeriods[newType] == 0) revert UnknownPeriod();
 
         if (block.timestamp < _trialEndsAt[account]) {
-            return (true, 0, 0, block.timestamp);
+            // Leaving the trial ends it and bills a whole period of the new plan right away.
+            chargedAmount = _priceOf(newType, _activePayToken[account]);
+            return (
+                true,
+                chargedAmount,
+                _tokenAmountOf(_activePayToken[account], chargedAmount),
+                block.timestamp
+            );
         }
         uint next = _nextChargeableAt[account][currentType];
         if (block.timestamp >= next) revert SettleDebtFirst(next);
@@ -668,7 +684,9 @@ contract Subscription is ReentrancyGuard {
     }
 
     /// @notice Give `subscriptionType` a free trial of `trialSeconds`, or pass 0 to withdraw
-    /// it. Affects new subscribes only — trials already running keep their anchor.
+    /// it. A plan with a non-zero trial is "trial-bearing"; that flag drives what happens when
+    /// an account changes into or out of it (see changeSubscription). Affects new subscribes
+    /// only — trials already running keep their anchor.
     /// @dev No upper bound on purpose: the trial length is whatever the owner (the timelock)
     /// decides, including longer than the plan's own period. It defers the first charge to
     /// now + trialSeconds; the billing schedule then runs off that anchor as usual.
@@ -678,8 +696,10 @@ contract Subscription is ReentrancyGuard {
         emit TrialPeriodChanged(subscriptionType, trialSeconds);
     }
 
-    function isTrialUsed(address account, uint subscriptionType) external view returns (bool) {
-        return _trialUsed[account][subscriptionType];
+    /// @notice Whether `account` has ever held a subscription. Once true the account can never
+    /// start a free trial again, on any plan — the trial is a first-subscription offer only.
+    function hasEverSubscribed(address account) external view returns (bool) {
+        return _everSubscribed[account];
     }
 
     /// @notice Whether a subscribe by `account` for `subscriptionType` right now would open a
@@ -1166,6 +1186,8 @@ contract Subscription is ReentrancyGuard {
         }
         _activeType[account] = subscriptionType;
         _activePayToken[account] = payToken;
+        // Burns the one-off trial eligibility, whether or not this subscribe used it.
+        _everSubscribed[account] = true;
         uint next = _nextChargeableAt[account][subscriptionType];
         // A fresh start adopts whatever the plan's period is right now and locks it in for the
         // life of this subscription. A resubscribe onto a running anchor keeps the period the
@@ -1182,7 +1204,6 @@ contract Subscription is ReentrancyGuard {
             // collector's renew at that moment takes the first full period, and every later
             // period follows the normal schedule off that same anchor — no special casing
             // anywhere in _renew/_settle. Cancelling before it lands stops the charge outright.
-            _trialUsed[account][subscriptionType] = true;
             uint trialEndsAt = block.timestamp + _trialPeriods[subscriptionType];
             _nextChargeableAt[account][subscriptionType] = trialEndsAt;
             _trialEndsAt[account] = trialEndsAt;
@@ -1239,19 +1260,28 @@ contract Subscription is ReentrancyGuard {
         _collect(payToken, account, requiredTokenAmount);
     }
 
-    /// @dev Free mid-trial swap. The trial keeps its end date, and the new plan's trial is burnt
-    /// too — otherwise the account could later cancel, let this one lapse, and claim a second
-    /// free trial on the plan it switched into.
-    function _switchDuringTrial(address account, uint currentType, uint newType) private {
-        uint trialEnd = _nextChargeableAt[account][currentType];
+    /// @dev Leave a running trial for another plan. The trial ends immediately and a full
+    /// period of the new plan is charged now, so the cycle restarts from this moment.
+    /// @dev The destination plan's own trial is deliberately NOT burnt: this account is paying
+    /// for it, not trialling it, so a trial it never consumed stays available to it later.
+    function _endTrialWithChange(address account, uint currentType, uint newType) private {
+        uint8 payToken = _activePayToken[account];
+        uint chargedAmount = _priceOf(newType, payToken);
+        uint requiredTokenAmount = _tokenAmountOf(payToken, chargedAmount);
+        uint32 newPeriod = _subscriptionPeriods[newType];
+        uint newNext = block.timestamp + newPeriod;
+
         delete _nextChargeableAt[account][currentType];
         delete _pendingType[account];
+        // The trial is over, so isInTrial() stops reporting it and a later change is priced
+        // pro-rata like any other.
+        delete _trialEndsAt[account];
         _activeType[account] = newType;
-        _nextChargeableAt[account][newType] = trialEnd;
-        // The first charge at trialEnd is a full period of the new plan, at its length.
-        _lockedPeriod[account] = _subscriptionPeriods[newType];
-        _trialUsed[account][newType] = true;
-        emit SubscriptionChangedDuringTrial(account, currentType, newType, trialEnd);
+        _lockedPeriod[account] = newPeriod;
+        _nextChargeableAt[account][newType] = newNext;
+
+        emit TrialEndedByChange(account, currentType, newType, payToken, chargedAmount, requiredTokenAmount, newNext);
+        _collect(payToken, account, requiredTokenAmount);
     }
 
     /// @dev Land a parked downgrade. Called from _renew/_settle once the paid-up period is over,
@@ -1295,14 +1325,13 @@ contract Subscription is ReentrancyGuard {
     /// @dev Single source of truth for "does this subscribe open a trial instead of charging".
     /// Called both by the subscribeXXX paths (to skip pricing and the transfer) and by
     /// _activate (to set the anchor), so the two can never disagree.
+    /// @dev Two conditions, and that is the whole rule: the plan offers a trial, and this is
+    /// the account's very first subscription. Nothing about renewals, cancelled-and-elapsed
+    /// accounts or per-plan bookkeeping is needed — _everSubscribed covers all of it, because
+    /// every one of those states implies the account has subscribed before.
     function _startsTrial(address account, uint subscriptionType) private view returns (bool) {
-        if (_trialPeriods[subscriptionType] == 0) return false;
-        if (_trialUsed[account][subscriptionType]) return false;
-        // Only a fresh start gets a trial, never a renewal of a subscription already running:
-        // either the account has no anchor on this type, or it is a cancelled-and-elapsed one
-        // whose anchors _activate is about to drop. Without this, an account that paid for a
-        // plan before a trial was configured would be handed a free period on resubscribe.
-        return _cancelled[account] || _nextChargeableAt[account][subscriptionType] == 0;
+        if (_everSubscribed[account]) return false;
+        return _trialPeriods[subscriptionType] != 0;
     }
 
     function _calculateAmountUSDT(uint rawAmount) private view returns (uint) {

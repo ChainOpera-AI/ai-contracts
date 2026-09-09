@@ -107,12 +107,14 @@ contract SubscriptionTest {
         _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "anchor = now + 30d");
     }
 
-    function test_OwnerCanGiveAndRemoveTrialsPerPlan() public {
+    /// Any plan can be given or denied a trial; a zero trial period simply means "no trial".
+    function test_OwnerCanGiveAnyPlanATrial() public {
         _assert(sub.getTrialPeriod(PREMIUM_MONTH) == 0, "no trial by default");
+        _assert(!sub.startsTrial(alice, PREMIUM_MONTH), "so none is offered");
+
         vm.prank(timelock);
         sub.setTrialPeriod(PREMIUM_MONTH, 7 days);
         _assert(sub.startsTrial(alice, PREMIUM_MONTH), "trial now offered");
-
         uint before = _bal(alice);
         _sub(alice, PREMIUM_MONTH);
         _assert(_bal(alice) == before, "premium trial charges nothing");
@@ -139,15 +141,17 @@ contract SubscriptionTest {
     }
 
     function test_ExistingPayerGetsNoTrialWhenOneIsAddedLater() public {
-        _sub(alice, GO_MONTH); // paid, no trial configured yet
         vm.prank(timelock);
-        sub.setTrialPeriod(GO_MONTH, uint32(TRIAL));
+        sub.setTrialPeriod(PLUS_MONTH, 0); // withdraw it, so alice subscribes as a payer
+        _sub(alice, PLUS_MONTH);
+        vm.prank(timelock);
+        sub.setTrialPeriod(PLUS_MONTH, uint32(TRIAL)); // offered again afterwards
 
         vm.warp(block.timestamp + PERIOD); // period up, alice resubscribes herself
-        _assert(!sub.startsTrial(alice, GO_MONTH), "renewal is not a fresh start");
+        _assert(!sub.startsTrial(alice, PLUS_MONTH), "renewal is not a fresh start");
         uint before = _bal(alice);
-        _sub(alice, GO_MONTH);
-        _assert(before - _bal(alice) == GO_PRICE * 2, "settles due period + pays one more");
+        _sub(alice, PLUS_MONTH);
+        _assert(before - _bal(alice) == PLUS_PRICE * 2, "settles due period + pays one more");
     }
 
     // --- cancel / restore / plan change ------------------------------------

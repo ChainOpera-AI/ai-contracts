@@ -25,6 +25,7 @@ contract PlanChangeTest {
     uint constant USD = 1e8;
     uint constant GO_PRICE = 5 * USD;
     uint constant PRO_PRICE = 200 * USD;
+    uint constant PLUS_PRICE = 1999 * USD / 100;
     uint constant GO_YEAR_PRICE = 48 * USD;
     uint constant PLUS_YEAR_PRICE = 19188 * USD / 100;
 
@@ -213,33 +214,117 @@ contract PlanChangeTest {
 
     // --- trials -------------------------------------------------------------
 
-    function test_MidTrialChangeIsFreeAndKeepsTheTrialEnd() public {
+    /// The trial belongs to the plan it was offered on. Leaving it ends it there and then,
+    /// and a full period of the new plan is charged immediately.
+    function test_MidTrialChangeEndsTheTrialAndChargesNow() public {
         _sub(PLUS_MONTH); // 3-day trial, nothing charged
-        uint trialEnd = sub.nextChargeableAt(alice);
         _assert(sub.isInTrial(alice), "on trial");
+        _assert(_rcv() == 0, "nothing charged yet");
 
         vm.warp(block.timestamp + 1 days);
-        _change(PRO_MONTH);
-        _assert(_rcv() == 0, "still nothing charged");
-        _assert(sub.getActiveType(alice) == PRO_MONTH, "swapped");
-        _assert(sub.nextChargeableAt(alice) == trialEnd, "trial end unchanged");
+        (bool immediate, uint charged,, uint effectiveAt) = sub.previewChange(alice, PRO_MONTH);
+        _assert(immediate, "takes effect now");
+        _assert(charged == PRO_PRICE, "a whole PRO period, nothing pro-rated");
+        _assert(effectiveAt == block.timestamp, "effective now");
 
-        // the first charge is a full PRO period
-        vm.warp(trialEnd);
-        vm.prank(feeCollector);
-        sub.renew(alice);
-        _assert(_rcv() == _usdt(PRO_PRICE), "first charge is PRO");
+        _change(PRO_MONTH);
+        _assert(_rcv() == _usdt(PRO_PRICE), "charged a full PRO period on the spot");
+        _assert(sub.getActiveType(alice) == PRO_MONTH, "swapped");
+        _assert(!sub.isInTrial(alice), "trial is over");
+        _assert(sub.getTrialEndsAt(alice) == 0, "trial cleared");
+        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "cycle restarts now");
     }
 
-    /// Switching mid-trial must burn the destination plan's trial too, or the account could
-    /// cancel, lapse, and claim a second free trial on it.
-    function test_MidTrialChangeBurnsTheDestinationTrial() public {
-        vm.prank(timelock);
-        sub.setTrialPeriod(PRO_MONTH, uint32(TRIAL));
+    /// Even a cheaper plan is charged in full: nothing was ever paid, so there is no remaining
+    /// value to pro-rate and nothing to park until period end.
+    function test_MidTrialChangeToACheaperPlanAlsoChargesNow() public {
+        _sub(PLUS_MONTH);
+        vm.warp(block.timestamp + 1 days);
+        _change(GO_MONTH);
+        _assert(_rcv() == _usdt(GO_PRICE), "a whole GO period charged now");
+        _assert(sub.getActiveType(alice) == GO_MONTH, "swapped immediately, not parked");
+        _assert(sub.getPendingType(alice) == 0, "nothing parked");
+    }
+
+    /// Leaving the trial spends it for good — coming back to PLUS_MONTH later is paid.
+    function test_MidTrialChangeSpendsThePlusTrialForGood() public {
         _sub(PLUS_MONTH);
         _change(PRO_MONTH);
-        _assert(sub.isTrialUsed(alice, PRO_MONTH), "PRO trial consumed");
-        _assert(!sub.startsTrial(alice, PRO_MONTH), "no second free ride");
+        _assert(sub.hasEverSubscribed(alice), "trial eligibility is spent");
+        _assert(!sub.startsTrial(alice, PLUS_MONTH), "no second free ride on PLUS");
+    }
+
+    /// The trial is a one-off tied to the first subscription, so moving onto another
+    /// trial-bearing plan is charged in full just like any other destination.
+    function test_MidTrialChangeToAnotherTrialPlanIsStillCharged() public {
+        vm.prank(timelock);
+        sub.setTrialPeriod(PRO_MONTH, 7 days);
+        _sub(PLUS_MONTH);
+        vm.warp(block.timestamp + 1 days);
+
+        (bool immediate, uint charged,,) = sub.previewChange(alice, PRO_MONTH);
+        _assert(immediate, "immediate");
+        _assert(charged == PRO_PRICE, "a whole PRO period, no second trial");
+
+        _change(PRO_MONTH);
+        _assert(_rcv() == _usdt(PRO_PRICE), "charged in full");
+        _assert(!sub.isInTrial(alice), "no trial running");
+        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "a paid cycle from now");
+    }
+
+    /// Having ever subscribed — even to a plan with no trial, even after cancelling and
+    /// lapsing — permanently ends trial eligibility.
+    function test_TrialIsGoneOnceAnyPlanHasBeenHeld() public {
+        vm.prank(timelock);
+        sub.setTrialPeriod(PLUS_MONTH, uint32(TRIAL));
+        _assert(sub.startsTrial(alice, PLUS_MONTH), "eligible before the first subscribe");
+
+        _sub(GO_MONTH); // a paid plan with no trial of its own
+        _assert(sub.hasEverSubscribed(alice), "eligibility burnt");
+        _assert(!sub.startsTrial(alice, PLUS_MONTH), "no trial any more");
+
+        // cancel, let it lapse, come back: still no trial
+        uint next = sub.nextChargeableAt(alice);
+        vm.prank(alice);
+        sub.cancelSubscription();
+        vm.warp(next);
+        uint paid = _rcv();
+        _sub(PLUS_MONTH);
+        _assert(_rcv() - paid == _usdt(PLUS_PRICE), "PLUS is paid for");
+        _assert(!sub.isInTrial(alice), "no trial on return");
+    }
+
+    /// Changing plans can never open a trial: changing presupposes a subscription, and having
+    /// one is exactly what disqualifies an account.
+    function test_ChangeOntoATrialPlanNeverTrials() public {
+        vm.prank(timelock);
+        sub.setTrialPeriod(PRO_MONTH, 7 days);
+        _sub(GO_MONTH);
+        vm.warp(block.timestamp + 10 days);
+        uint paid = _rcv();
+
+        // priced as an ordinary pro-rata upgrade, taking effect at once
+        (bool immediate, uint charged,,) = sub.previewChange(alice, PRO_MONTH);
+        _assert(immediate, "immediate, not parked for a trial");
+        _assert(charged == (PRO_PRICE - GO_PRICE) * 20 days / PERIOD, "plain pro-rata difference");
+
+        _change(PRO_MONTH);
+        _assert(_rcv() > paid, "money moved");
+        _assert(!sub.isInTrial(alice), "no trial");
+    }
+
+    /// Cancelling during the trial is unaffected: it still costs nothing.
+    function test_CancellingDuringTrialStillCostsNothing() public {
+        _sub(PLUS_MONTH);
+        uint trialEnd = sub.nextChargeableAt(alice);
+        vm.warp(block.timestamp + 1 days);
+        vm.prank(alice);
+        sub.cancelSubscription();
+        _assert(_rcv() == 0, "no charge");
+        vm.warp(trialEnd);
+        vm.prank(feeCollector);
+        vm.expectRevert(abi.encodeWithSignature("AlreadyCancelled()"));
+        sub.renew(alice);
     }
 
     // --- guards -------------------------------------------------------------
