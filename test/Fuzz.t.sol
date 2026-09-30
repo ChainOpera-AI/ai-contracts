@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../contracts/subscription_fee_collector.sol";
 import "./mocks.sol";
+import "./deploy.sol";
 
 /// A PancakeV3 pool whose TWAP can be moved between calls.
 contract VariableTickPool {
@@ -52,7 +53,7 @@ contract FuzzTest {
         VariableTickPool(POOL).setTokens(COAI, USDT);
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = new Subscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
         timelock = sub.getOwner();
         MockERC20(USDT).mint(alice, 1e30);
         MockERC20(COAI).mint(alice, 1e30);
@@ -89,7 +90,7 @@ contract FuzzTest {
         sub.subscriptionUSDT(fromType, address(0));
         uint spentOnFirstPeriod = _paid();
 
-        if (elapsed > 0) vm.warp(block.timestamp + elapsed);
+        if (elapsed > 0) vm.warp(vm.getBlockTimestamp() + elapsed);
         (bool immediate, uint charged,,) = sub.previewChange(alice, toType);
         if (!immediate) return; // parked downgrade, nothing charged
 
@@ -110,7 +111,7 @@ contract FuzzTest {
         uint toType = _bound(toSeed, 1, 8);
         vm.prank(alice);
         sub.subscriptionUSDT(1, address(0));
-        vm.warp(block.timestamp + _bound(elapsedSeed, 0, PERIOD - 1));
+        vm.warp(vm.getBlockTimestamp() + _bound(elapsedSeed, 0, PERIOD - 1));
 
         vm.prank(alice);
         try sub.changeSubscription(toType) {} catch { return; }
@@ -119,7 +120,7 @@ contract FuzzTest {
         _assert(active != 0, "lost the subscription");
         _assert(sub.getLockedPeriod(alice) != 0, "lost the period");
         uint next = sub.getNextChargeableAt(alice, active);
-        _assert(next > block.timestamp, "left already in arrears");
+        _assert(next > vm.getBlockTimestamp(), "left already in arrears");
         uint pending = sub.getPendingType(alice);
         if (pending != 0) _assert(pending == toType && active == 1, "parked the wrong thing");
         else _assert(active == toType, "immediate change did not take effect");
@@ -141,7 +142,7 @@ contract FuzzTest {
         uint expectedPeriods = delay / PERIOD + 1;
         _assert(_paid() - paidBefore == unitPrice * expectedPeriods, "arrears mispriced");
         _assert(sub.nextChargeableAt(alice) == next + expectedPeriods * PERIOD, "anchor drifted");
-        _assert(sub.nextChargeableAt(alice) > block.timestamp, "still due right after renewing");
+        _assert(sub.nextChargeableAt(alice) > vm.getBlockTimestamp(), "still due right after renewing");
     }
 
     // --- COAI pricing under a moving TWAP ----------------------------------
@@ -223,7 +224,7 @@ contract FuzzTest {
 
         _assert(_paid() - before == unit * owed, "charged something other than what was owed");
         _assert(sub.nextChargeableAt(alice) == next + owed * PERIOD, "anchor moved by the wrong amount");
-        _assert(sub.nextChargeableAt(alice) > block.timestamp, "still in arrears after renewing");
+        _assert(sub.nextChargeableAt(alice) > vm.getBlockTimestamp(), "still in arrears after renewing");
     }
 
     /// Renewing by hand and letting the fee collector renew must cost the same.

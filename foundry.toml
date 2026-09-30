@@ -7,6 +7,9 @@ out = "out"
 libs = []
 optimizer = true
 optimizer_runs = 200
+# Required: without the IR pipeline Subscription compiles to ~27.9KB and cannot be deployed.
+# The initializer's code counts against the 24KB runtime limit, unlike a constructor's.
+via_ir = true
 solc_version = "0.8.28"
 remappings = [
     "@openzeppelin/=node_modules/@openzeppelin/",

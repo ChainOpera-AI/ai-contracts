@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../contracts/subscription_fee_collector.sol";
 import "./mocks.sol";
+import "./deploy.sol";
 
 contract SubscriptionTest {
     Vm constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
@@ -36,7 +37,7 @@ contract SubscriptionTest {
 
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = new Subscription(receiver, feeCollector, terminator, 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, terminator, 0, roles, roles, address(0));
         timelock = sub.getOwner();
 
         MockERC20(USDT).mint(alice, 1_000_000e18);
@@ -64,7 +65,7 @@ contract SubscriptionTest {
         _sub(alice, PLUS_MONTH);
         _assert(_bal(alice) == before, "trial must not charge");
         _assert(_bal(receiver) == 0, "receiver must get nothing");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + TRIAL, "anchor = now + 3d");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + TRIAL, "anchor = now + 3d");
         _assert(sub.getEffectiveType(alice) == PLUS_MONTH, "entitled during trial");
     }
 
@@ -89,7 +90,7 @@ contract SubscriptionTest {
         _sub(alice, PLUS_MONTH);
         uint trialEnd = sub.nextChargeableAt(alice);
 
-        vm.warp(block.timestamp + 2 days);
+        vm.warp(vm.getBlockTimestamp() + 2 days);
         vm.prank(alice);
         sub.cancelSubscription();
         _assert(_bal(receiver) == 0, "cancel inside trial charges nothing");
@@ -107,7 +108,7 @@ contract SubscriptionTest {
         uint before = _bal(alice);
         _sub(alice, GO_MONTH);
         _assert(before - _bal(alice) == GO_PRICE, "GO charges upfront");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "anchor = now + 30d");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "anchor = now + 30d");
     }
 
     /// Any plan can be given or denied a trial; a zero trial period simply means "no trial".
@@ -121,7 +122,7 @@ contract SubscriptionTest {
         uint before = _bal(alice);
         _sub(alice, PREMIUM_MONTH);
         _assert(_bal(alice) == before, "premium trial charges nothing");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + 7 days, "7d trial honoured");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + 7 days, "7d trial honoured");
 
         vm.prank(timelock);
         sub.setTrialPeriod(PLUS_MONTH, 0);
@@ -150,7 +151,7 @@ contract SubscriptionTest {
         vm.prank(timelock);
         sub.setTrialPeriod(PLUS_MONTH, uint32(TRIAL)); // offered again afterwards
 
-        vm.warp(block.timestamp + PERIOD); // period up, alice resubscribes herself
+        vm.warp(vm.getBlockTimestamp() + PERIOD); // period up, alice resubscribes herself
         _assert(!sub.startsTrial(alice, PLUS_MONTH), "renewal is not a fresh start");
         uint before = _bal(alice);
         _sub(alice, PLUS_MONTH);
@@ -164,7 +165,7 @@ contract SubscriptionTest {
         uint trialEnd = sub.nextChargeableAt(alice);
         vm.prank(alice);
         sub.cancelSubscription();
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         _assert(sub.canRestore(alice), "restorable inside trial");
         vm.prank(alice);
         sub.restoreSubscription();
@@ -215,14 +216,14 @@ contract SubscriptionTest {
         uint before = _bal(alice);
         _sub(alice, GO_MONTH);
         _assert(before - _bal(alice) == GO_PRICE, "only one period, gap not billed");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "anchor restarts at now");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "anchor restarts at now");
     }
 
     // --- setSubscriptionPeriod only ever affects new subscriptions ----------
 
     function test_PeriodChangeLeavesExistingSubscribersOnTheirOwnCadence() public {
         _sub(alice, GO_MONTH);
-        uint t0 = block.timestamp;
+        uint t0 = vm.getBlockTimestamp();
         _assert(sub.getLockedPeriod(alice) == PERIOD, "locked at 30d");
 
         vm.prank(timelock);
@@ -246,7 +247,7 @@ contract SubscriptionTest {
         _fund(bob);
         _sub(bob, GO_MONTH);
         _assert(sub.getLockedPeriod(bob) == 7 days, "bob locked at the new 7d");
-        _assert(sub.nextChargeableAt(bob) == block.timestamp + 7 days, "bob renews in 7d");
+        _assert(sub.nextChargeableAt(bob) == vm.getBlockTimestamp() + 7 days, "bob renews in 7d");
         _assert(sub.getLockedPeriod(alice) == PERIOD, "alice untouched");
     }
 
@@ -254,7 +255,7 @@ contract SubscriptionTest {
     /// arrears that accrued while the old period was in force.
     function test_ShorteningPeriodCannotInflateExistingArrears() public {
         _sub(alice, GO_MONTH);
-        uint t0 = block.timestamp;
+        uint t0 = vm.getBlockTimestamp();
         uint paid = _bal(receiver);
 
         // fee collector is 60 days late, and the owner shortens the plan before the catch-up
@@ -280,7 +281,7 @@ contract SubscriptionTest {
         _sub(alice, GO_MONTH);
 
         _assert(sub.getLockedPeriod(alice) == 7 days, "fresh start picks up the new period");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + 7 days, "and anchors on it");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + 7 days, "and anchors on it");
     }
 
     // --- the price list itself ----------------------------------------------
@@ -322,7 +323,7 @@ contract SubscriptionTest {
         _sub(alice, GO_MONTH);
         _assert(before - _bal(alice) == GO_PRICE, "exactly one period");
         _assert(sub.nextChargeableAt(alice) == next + PERIOD, "anchor advanced by exactly one");
-        _assert(sub.nextChargeableAt(alice) > block.timestamp, "and is no longer in arrears");
+        _assert(sub.nextChargeableAt(alice) > vm.getBlockTimestamp(), "and is no longer in arrears");
     }
 
     /// Several periods owed: every one of them is charged, and not one more.

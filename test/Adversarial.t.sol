@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../contracts/subscription_fee_collector.sol";
 import "./mocks.sol";
+import "./deploy.sol";
 
 /// A token that tries to re-enter the subscription contract from inside transferFrom.
 contract ReentrantToken {
@@ -77,7 +78,7 @@ contract AdversarialTest {
         MockPool(POOL).setTokens(COAI, USDT);
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = new Subscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
         timelock = sub.getOwner();
         MockERC20(USDT).mint(alice, 1_000_000e18);
         vm.prank(alice);
@@ -152,7 +153,7 @@ contract AdversarialTest {
     function test_HugePriceDoesNotWrapTheDeltaSign() public {
         vm.prank(alice);
         sub.subscriptionUSDT(GO_MONTH, address(0));
-        vm.warp(block.timestamp + 10 days);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
 
         // 1e30 USD*1e8 — absurd, but reachable by a fat-fingered setSubscriptionPrice
         vm.prank(timelock);
@@ -227,7 +228,7 @@ contract AdversarialTest {
     function test_RenewSelfIsUnreachableFromOutside() public {
         vm.prank(alice);
         sub.subscriptionUSDT(GO_MONTH, address(0));
-        vm.warp(block.timestamp + PERIOD);
+        vm.warp(vm.getBlockTimestamp() + PERIOD);
 
         vm.prank(feeCollector);
         try sub.renewSelf(alice) { _assert(false, "fee collector must not reach it"); } catch {}
@@ -272,7 +273,7 @@ contract AdversarialTest {
     function test_TerminateLeavesNoAnchorToTripOverLater() public {
         vm.prank(alice);
         sub.subscriptionUSDT(GO_MONTH, address(0));
-        vm.warp(block.timestamp + 10 days);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
         vm.prank(address(0xDEAD));
         sub.terminateSubscription(alice);
         _assert(sub.getNextChargeableAt(alice, GO_MONTH) == 0, "anchor cleared");
@@ -280,20 +281,20 @@ contract AdversarialTest {
         // coming back to the same plan starts a clean period from now, not from a stale anchor
         vm.prank(alice);
         sub.subscriptionUSDT(GO_MONTH, address(0));
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "fresh period");
-        _assert(sub.nextChargeableAt(alice) > block.timestamp, "not born in arrears");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "fresh period");
+        _assert(sub.nextChargeableAt(alice) > vm.getBlockTimestamp(), "not born in arrears");
 
         // and the same holds after bouncing through a second plan
         vm.prank(address(0xDEAD));
         sub.terminateSubscription(alice);
         vm.prank(alice);
         sub.subscriptionUSDT(PRO_MONTH, address(0));
-        vm.warp(block.timestamp + 5 days);
+        vm.warp(vm.getBlockTimestamp() + 5 days);
         vm.prank(address(0xDEAD));
         sub.terminateSubscription(alice);
         _assert(sub.getNextChargeableAt(alice, PRO_MONTH) == 0, "second plan cleared too");
         vm.prank(alice);
         sub.subscriptionUSDT(GO_MONTH, address(0));
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "still clean");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "still clean");
     }
 }

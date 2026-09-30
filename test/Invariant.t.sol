@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../contracts/subscription_fee_collector.sol";
 import "./mocks.sol";
+import "./deploy.sol";
 
 /// Drives the contract with bounded random user actions so the fuzzer can explore state the
 /// hand-written tests do not reach. Every call is wrapped: a revert is a legitimate outcome,
@@ -72,7 +73,7 @@ contract Handler {
 
     function passTime(uint secondsSeed) external {
         // 1 hour .. ~45 days, so periods and trials both get crossed
-        vm.warp(block.timestamp + 1 hours + (secondsSeed % 39 days));
+        vm.warp(vm.getBlockTimestamp() + 1 hours + (secondsSeed % 39 days));
     }
 
     function actorCount() external view returns (uint) { return actors.length; }
@@ -105,7 +106,7 @@ contract InvariantTest {
 
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = new Subscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
 
         for (uint i = 0; i < ACTORS; i++) {
             address a = address(uint160(0xA000 + i));
@@ -196,7 +197,7 @@ contract InvariantTest {
             if (eff == 0) continue;
             _assert(eff == sub.getActiveType(a), "effective type diverged from the stored one");
             if (sub.isCancelled(a)) {
-                _assert(block.timestamp < sub.getNextChargeableAt(a, eff), "entitled past a cancelled period");
+                _assert(vm.getBlockTimestamp() < sub.getNextChargeableAt(a, eff), "entitled past a cancelled period");
             }
         }
     }

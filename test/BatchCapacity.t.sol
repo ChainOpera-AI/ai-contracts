@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../contracts/subscription_fee_collector.sol";
 import "./mocks.sol";
+import "./deploy.sol";
 
 /// How many accounts one renewBatch can actually carry, and what a failure costs.
 contract BatchCapacityTest {
@@ -25,7 +26,7 @@ contract BatchCapacityTest {
         MockPool(POOL).setTokens(COAI, USDT);
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = new Subscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
         vm.warp(1_000_000);
     }
 
@@ -47,7 +48,7 @@ contract BatchCapacityTest {
                 MockERC20(USDT).approve(address(sub), 0);
             }
         }
-        vm.warp(block.timestamp + 30 days);
+        vm.warp(vm.getBlockTimestamp() + 30 days);
         return list;
     }
 

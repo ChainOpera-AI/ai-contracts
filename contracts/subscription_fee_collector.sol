@@ -3,13 +3,18 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/governance/TimelockController.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
+import "@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol";
 import "./lib/IPancakeV3PoolState.sol";
 import "./lib/CoaiTwapPricing.sol";
 import "./lib/UsdPricing.sol";
 
-contract Subscription is ReentrancyGuard {
+/// @dev Deployed behind an ERC1967 proxy. The storage layout below is part of the contract's
+/// ABI as far as upgrades are concerned: existing variables may never be reordered, retyped or
+/// removed, and anything new goes at the end, taking from __gap. Getting that wrong silently
+/// makes one mapping read another's slots.
+contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
     using SafeERC20 for ERC20;
     error SwitchOff();
     error InvalidTwapInterval();
@@ -46,6 +51,7 @@ contract Subscription is ReentrancyGuard {
     error NotListed(uint subscriptionType);
     error AlreadyListed(uint subscriptionType);
     error InvalidInviter();
+    error ImportAlreadyClosed();
 
     event SubscribedUSDT(
         address indexed account,
@@ -307,6 +313,8 @@ contract Subscription is ReentrancyGuard {
     // each successful subscribe overwrites the stored value, so users can switch their referrer
     // on a later call. Subscribers cannot invite themselves. Persists across cancel/terminate.
     mapping(address => address) private _inviters;
+    // Set once by closeImport(); after that importAccounts is dead for good.
+    bool private _importClosed;
 
     // subscriptionType id constants. Tier order (low → high): GO < PLUS < PREMIUM < PRO.
     // IDs 1-4 are monthly plans in tier order, 5-8 are yearly plans in tier order.
@@ -346,18 +354,29 @@ contract Subscription is ReentrancyGuard {
     address constant DEFAULT_COAI = 0x0A8D6C86e1bcE73fE4D0bD531e1a567306836EA5;
     address constant DEFAULT_USDC = 0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d;
 
-    constructor(address receiver, address feeCollector, address subscriptionTerminator, uint minDelay, address[] memory proposers, address[] memory executors, address admin) {
+    /// @dev The implementation contract must never be initialized on its own — only the proxy
+    /// holds real state. Without this, anyone could initialize the implementation and, through
+    /// _authorizeUpgrade, drive an upgrade on it.
+    /// @custom:oz-upgrades-unsafe-allow constructor
+    constructor() {
+        _disableInitializers();
+    }
+
+    /// @notice Runs once, through the proxy, in place of a constructor. In Remix: tick
+    /// "Deploy with Proxy" and these are the arguments it asks for.
+    /// @param owner_ The address that will hold every onlyOwner power, including the power to
+    /// upgrade this contract. Deploy a TimelockController separately and pass it here. It used
+    /// to be deployed inside this function, but `new TimelockController(...)` embeds that
+    /// contract's entire creation code into this one — harmless in a constructor, where it
+    /// lives in the initcode, but an initializer's code is runtime code and it cost 8.7KB of
+    /// the 24KB deployable limit. Passing the address in also means an existing timelock or a
+    /// multisig can be reused.
+    function initialize(address receiver, address feeCollector, address subscriptionTerminator, address owner_) public initializer {
+        __ReentrancyGuard_init();
+        __UUPSUpgradeable_init();
         if (receiver == address(0) || feeCollector == address(0) || subscriptionTerminator == address(0)) revert ZeroAddress();
         if (receiver == address(this)) revert InvalidReceiver();
-        // `admin`, when non-zero, holds TIMELOCK_ADMIN_ROLE and can grant or revoke every other
-        // role with no delay. That is deliberate here: it keeps an operational key able to
-        // re-shuffle roles directly. It also means the timelock binds only those without that
-        // role — an admin can hand itself PROPOSER and EXECUTOR and push any owner call through,
-        // and strip whoever might have cancelled it. Pass address(0) to have the timelock
-        // administer itself, which is the configuration that makes the delay enforceable.
-        // Empty proposers/executors would deadlock the timelock and leave the contract
-        // unable to ever execute onlyOwner mutations.
-        if (proposers.length == 0 || executors.length == 0) revert InvalidTimelockConfig();
+        if (owner_ == address(0)) revert ZeroAddress();
         _feeCollector = feeCollector;
         emit FeeCollectorChanged(feeCollector);
         _subscriptionTerminator = subscriptionTerminator;
@@ -373,66 +392,35 @@ contract Subscription is ReentrancyGuard {
         _coaiPriceFeed = IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL);
         _coaiIsToken0 = CoaiTwapPricing.resolveCoaiIsToken0(IPancakeV3PoolState(DEFAULT_PANCAKE_COAI_POOL), DEFAULT_COAI);
         _receiver = receiver;
-        TimelockController timelock = new TimelockController(minDelay, proposers, executors, admin);
-        _owner = address(timelock);
+        _owner = owner_;
         emit OwnerChanged(address(0), _owner);
         _switch = true;
-        _subscriptionPrices[SUB_TYPE_GO_MONTH]      = DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH;
-        _subscriptionPrices[SUB_TYPE_PLUS_MONTH]    = DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH;
-        _subscriptionPrices[SUB_TYPE_PREMIUM_MONTH] = DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH;
-        _subscriptionPrices[SUB_TYPE_PRO_MONTH]     = DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH;
-        _subscriptionPrices[SUB_TYPE_GO_YEAR]       = DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR;
-        _subscriptionPrices[SUB_TYPE_PLUS_YEAR]     = DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR;
-        _subscriptionPrices[SUB_TYPE_PREMIUM_YEAR]  = DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR;
-        _subscriptionPrices[SUB_TYPE_PRO_YEAR]      = DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR;
-        emit SubscriptionPriceChanged(SUB_TYPE_GO_MONTH,      DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH);
-        emit SubscriptionPriceChanged(SUB_TYPE_PLUS_MONTH,    DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH);
-        emit SubscriptionPriceChanged(SUB_TYPE_PREMIUM_MONTH, DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH);
-        emit SubscriptionPriceChanged(SUB_TYPE_PRO_MONTH,     DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH);
-        emit SubscriptionPriceChanged(SUB_TYPE_GO_YEAR,       DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR);
-        emit SubscriptionPriceChanged(SUB_TYPE_PLUS_YEAR,     DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR);
-        emit SubscriptionPriceChanged(SUB_TYPE_PREMIUM_YEAR,  DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR);
-        emit SubscriptionPriceChanged(SUB_TYPE_PRO_YEAR,      DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR);
-        _discounts[PAY_TOKEN_USDT] = DISCOUNT_BASE; // no discount for USDT
-        _discounts[PAY_TOKEN_COAI] = DEFAULT_DISCOUNT_COAI;
-        _discounts[PAY_TOKEN_USDC] = DISCOUNT_BASE; // no discount for USDC
-        emit DiscountChanged(PAY_TOKEN_USDT, DISCOUNT_BASE);
-        emit DiscountChanged(PAY_TOKEN_COAI, DEFAULT_DISCOUNT_COAI);
-        emit DiscountChanged(PAY_TOKEN_USDC, DISCOUNT_BASE);
-        _subscriptionPeriods[SUB_TYPE_GO_MONTH]      = PERIOD_MONTH;
-        _subscriptionPeriods[SUB_TYPE_PLUS_MONTH]    = PERIOD_MONTH;
-        _subscriptionPeriods[SUB_TYPE_PREMIUM_MONTH] = PERIOD_MONTH;
-        _subscriptionPeriods[SUB_TYPE_PRO_MONTH]     = PERIOD_MONTH;
-        _subscriptionPeriods[SUB_TYPE_GO_YEAR]       = PERIOD_YEAR;
-        _subscriptionPeriods[SUB_TYPE_PLUS_YEAR]     = PERIOD_YEAR;
-        _subscriptionPeriods[SUB_TYPE_PREMIUM_YEAR]  = PERIOD_YEAR;
-        _subscriptionPeriods[SUB_TYPE_PRO_YEAR]      = PERIOD_YEAR;
-        emit SubscriptionPeriodChanged(SUB_TYPE_GO_MONTH,      PERIOD_MONTH);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_MONTH,    PERIOD_MONTH);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PREMIUM_MONTH, PERIOD_MONTH);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PRO_MONTH,     PERIOD_MONTH);
-        emit SubscriptionPeriodChanged(SUB_TYPE_GO_YEAR,       PERIOD_YEAR);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PLUS_YEAR,     PERIOD_YEAR);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PREMIUM_YEAR,  PERIOD_YEAR);
-        emit SubscriptionPeriodChanged(SUB_TYPE_PRO_YEAR,      PERIOD_YEAR);
+        // Loops rather than 40-odd unrolled writes: a constructor's code lives in the initcode
+        // and does not count against the 24KB runtime limit, but an initializer's does. Written
+        // out longhand this block alone cost several kilobytes of the deployable contract.
+        uint[8] memory prices = [
+            DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH,      DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH,
+            DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH, DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH,
+            DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR,       DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR,
+            DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR,  DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR
+        ];
+        for (uint i = 0; i < 8; i++) {
+            uint t = i + 1;                                  // plan ids are 1..8, monthly then yearly
+            uint32 period = i < 4 ? PERIOD_MONTH : PERIOD_YEAR;
+            _subscriptionPrices[t] = prices[i];
+            _subscriptionPeriods[t] = period;
+            _subscriptionListed[t] = true;
+            emit SubscriptionPriceChanged(t, prices[i]);
+            emit SubscriptionPeriodChanged(t, period);
+            emit SubscriptionListed(t);
+        }
+        for (uint8 payToken = PAY_TOKEN_USDT; payToken <= PAY_TOKEN_USDC; payToken++) {
+            uint discount = payToken == PAY_TOKEN_COAI ? DEFAULT_DISCOUNT_COAI : DISCOUNT_BASE;
+            _discounts[payToken] = discount;
+            emit DiscountChanged(payToken, discount);
+        }
         _trialPeriods[SUB_TYPE_PLUS_MONTH] = DEFAULT_TRIAL_PLUS_MONTH;
         emit TrialPeriodChanged(SUB_TYPE_PLUS_MONTH, DEFAULT_TRIAL_PLUS_MONTH);
-        _subscriptionListed[SUB_TYPE_GO_MONTH]      = true;
-        _subscriptionListed[SUB_TYPE_PLUS_MONTH]    = true;
-        _subscriptionListed[SUB_TYPE_PREMIUM_MONTH] = true;
-        _subscriptionListed[SUB_TYPE_PRO_MONTH]     = true;
-        _subscriptionListed[SUB_TYPE_GO_YEAR]       = true;
-        _subscriptionListed[SUB_TYPE_PLUS_YEAR]     = true;
-        _subscriptionListed[SUB_TYPE_PREMIUM_YEAR]  = true;
-        _subscriptionListed[SUB_TYPE_PRO_YEAR]      = true;
-        emit SubscriptionListed(SUB_TYPE_GO_MONTH);
-        emit SubscriptionListed(SUB_TYPE_PLUS_MONTH);
-        emit SubscriptionListed(SUB_TYPE_PREMIUM_MONTH);
-        emit SubscriptionListed(SUB_TYPE_PRO_MONTH);
-        emit SubscriptionListed(SUB_TYPE_GO_YEAR);
-        emit SubscriptionListed(SUB_TYPE_PLUS_YEAR);
-        emit SubscriptionListed(SUB_TYPE_PREMIUM_YEAR);
-        emit SubscriptionListed(SUB_TYPE_PRO_YEAR);
     }
 
     function subscriptionUSDT(uint subscriptionType, address inviter) switchOn external nonReentrant {
@@ -1397,4 +1385,85 @@ contract Subscription is ReentrancyGuard {
         return UsdPricing.applyDiscount(price, _discounts[payToken]);
     }
 
+    // ---------------- upgradeability ----------------
+
+    /// @dev Only the owner (the TimelockController this contract deployed) may replace the
+    /// implementation. Note what that means in practice: an upgrade can change ANY logic here,
+    /// including where the tokens users have approved end up. It is strictly more power than
+    /// every setter on this contract put together.
+    function _authorizeUpgrade(address) internal override onlyOwner {}
+
+    /// @notice The implementation currently behind the proxy. Handy for verifying an upgrade
+    /// landed, and for checking what is running before trusting the contract.
+    function getImplementation() external view returns (address) {
+        return ERC1967Utils_getImplementation();
+    }
+
+    function ERC1967Utils_getImplementation() private view returns (address impl) {
+        // ERC-1967 implementation slot: keccak256("eip1967.proxy.implementation") - 1
+        bytes32 slot = 0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc;
+        assembly { impl := sload(slot) }
+    }
+
+    // ---------------- migration from a previous deployment ----------------
+
+    /// @notice One account's full billing state, as read from an earlier deployment.
+    struct ImportedAccount {
+        address account;
+        uint subscriptionType;   // 0 skips the account entirely
+        uint8 payToken;          // 1 USDT, 2 COAI, 3 USDC
+        uint32 lockedPeriod;     // the period this account is billed on
+        uint nextChargeableAt;   // absolute timestamp
+        uint pendingType;        // 0 = no parked downgrade
+        uint trialEndsAt;        // 0 = never had a trial
+        bool cancelled;
+        bool everSubscribed;     // false lets the account still claim its one free trial
+        address inviter;
+    }
+
+    event AccountsImported(uint count, address indexed by);
+    event ImportClosed(uint closedAt);
+
+    /// @notice Copy account state in from a previous deployment. Owner-only, and it writes the
+    /// same fields a subscribe would, so the imported account behaves exactly like a native one:
+    /// renew, settle, cancel, restore and changeSubscription all work off these values.
+    /// @dev Rows with subscriptionType 0 are skipped, so a batch can carry gaps. This does NOT
+    /// move any money — it only reproduces bookkeeping. Verify the source values first: nothing
+    /// here can tell a correct anchor from a wrong one.
+    function importAccounts(ImportedAccount[] calldata rows) onlyOwner external {
+        if (_importClosed) revert ImportAlreadyClosed();
+        uint written;
+        for (uint i = 0; i < rows.length; i++) {
+            ImportedAccount calldata r = rows[i];
+            if (r.subscriptionType == 0) continue;
+            if (r.lockedPeriod == 0) revert UnknownPeriod();
+            _activeType[r.account] = r.subscriptionType;
+            _activePayToken[r.account] = r.payToken;
+            _lockedPeriod[r.account] = r.lockedPeriod;
+            _nextChargeableAt[r.account][r.subscriptionType] = r.nextChargeableAt;
+            _cancelled[r.account] = r.cancelled;
+            _pendingType[r.account] = r.pendingType;
+            _trialEndsAt[r.account] = r.trialEndsAt;
+            _everSubscribed[r.account] = r.everSubscribed;
+            _inviters[r.account] = r.inviter;
+            written++;
+        }
+        emit AccountsImported(written, msg.sender);
+    }
+
+    function isImportClosed() external view returns (bool) {
+        return _importClosed;
+    }
+
+    /// @notice Permanently disable importAccounts. Optional — nothing forces you to call it —
+    /// but once the migration is done this removes the owner's ability to rewrite any account's
+    /// billing state, and it cannot be undone.
+    function closeImport() onlyOwner external {
+        _importClosed = true;
+        emit ImportClosed(block.timestamp);
+    }
+
+    /// @dev Reserved so future versions can add state without disturbing the layout above.
+    /// Adding a variable means taking one slot from here, never appending past it.
+    uint256[40] private __gap;
 }

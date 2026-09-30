@@ -3,6 +3,7 @@ pragma solidity ^0.8.20;
 
 import "../contracts/subscription_fee_collector.sol";
 import "./mocks.sol";
+import "./deploy.sol";
 
 /// changeSubscription: upgrades charge now, downgrades wait for the period to end.
 contract PlanChangeTest {
@@ -45,7 +46,7 @@ contract PlanChangeTest {
         MockPool(POOL).setTokens(COAI, USDT);
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = new Subscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
         timelock = sub.getOwner();
         MockERC20(USDT).mint(alice, 1_000_000e18);
         vm.prank(alice);
@@ -64,7 +65,7 @@ contract PlanChangeTest {
     function test_UpgradeSamePeriodKeepsTheAnchorAndChargesTheDifference() public {
         _sub(GO_MONTH);
         uint next = sub.nextChargeableAt(alice);
-        vm.warp(block.timestamp + 10 days);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
         uint paid = _rcv();
 
         // (200 - 5) * 20/30 = $130
@@ -72,7 +73,7 @@ contract PlanChangeTest {
         _assert(immediate, "upgrade is immediate");
         _assert(charged == 130 * USD, "preview says $130");
         _assert(tokens == _usdt(130 * USD), "in USDT");
-        _assert(effectiveAt == block.timestamp, "effective now");
+        _assert(effectiveAt == vm.getBlockTimestamp(), "effective now");
 
         _change(PRO_MONTH);
         _assert(_rcv() - paid == _usdt(130 * USD), "charged the difference");
@@ -90,7 +91,7 @@ contract PlanChangeTest {
     /// A different-length plan buys a whole new cycle, crediting the unused tail of the old one.
     function test_UpgradeToDifferentPeriodRestartsTheCycle() public {
         _sub(GO_MONTH);
-        vm.warp(block.timestamp + 10 days);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
         uint paid = _rcv();
 
         // 48 - 5 * 20/30 = 48 - 3.33333333 = $44.66666667
@@ -101,14 +102,14 @@ contract PlanChangeTest {
         _change(GO_YEAR);
         _assert(_rcv() - paid == _usdt(expected), "charged a year minus the credit");
         _assert(sub.getLockedPeriod(alice) == YEAR, "now on a yearly cycle");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + YEAR, "cycle restarts now");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + YEAR, "cycle restarts now");
     }
 
     /// Dropping a tier but moving to a yearly plan still costs money, so it goes through
     /// immediately rather than being parked.
     function test_LowerTierButLongerPeriodIsStillPaidUpfront() public {
         _sub(PRO_MONTH);
-        vm.warp(block.timestamp + 10 days);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
         uint paid = _rcv();
 
         // 191.88 - 200 * 20/30 = $58.54666667
@@ -123,7 +124,7 @@ contract PlanChangeTest {
     function test_DowngradeIsParkedUntilThePeriodEnds() public {
         _sub(PRO_MONTH);
         uint next = sub.nextChargeableAt(alice);
-        vm.warp(block.timestamp + 10 days);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
         uint paid = _rcv();
 
         (bool immediate, uint charged,, uint effectiveAt) = sub.previewChange(alice, GO_MONTH);
@@ -162,7 +163,7 @@ contract PlanChangeTest {
 
     function test_UpgradingDiscardsAParkedDowngrade() public {
         _sub(PLUS_MONTH);
-        vm.warp(block.timestamp + TRIAL); // let the trial lapse
+        vm.warp(vm.getBlockTimestamp() + TRIAL); // let the trial lapse
         vm.prank(feeCollector);
         sub.renew(alice);
 
@@ -221,25 +222,25 @@ contract PlanChangeTest {
         _assert(sub.isInTrial(alice), "on trial");
         _assert(_rcv() == 0, "nothing charged yet");
 
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         (bool immediate, uint charged,, uint effectiveAt) = sub.previewChange(alice, PRO_MONTH);
         _assert(immediate, "takes effect now");
         _assert(charged == PRO_PRICE, "a whole PRO period, nothing pro-rated");
-        _assert(effectiveAt == block.timestamp, "effective now");
+        _assert(effectiveAt == vm.getBlockTimestamp(), "effective now");
 
         _change(PRO_MONTH);
         _assert(_rcv() == _usdt(PRO_PRICE), "charged a full PRO period on the spot");
         _assert(sub.getActiveType(alice) == PRO_MONTH, "swapped");
         _assert(!sub.isInTrial(alice), "trial is over");
         _assert(sub.getTrialEndsAt(alice) == 0, "trial cleared");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "cycle restarts now");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "cycle restarts now");
     }
 
     /// Even a cheaper plan is charged in full: nothing was ever paid, so there is no remaining
     /// value to pro-rate and nothing to park until period end.
     function test_MidTrialChangeToACheaperPlanAlsoChargesNow() public {
         _sub(PLUS_MONTH);
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         _change(GO_MONTH);
         _assert(_rcv() == _usdt(GO_PRICE), "a whole GO period charged now");
         _assert(sub.getActiveType(alice) == GO_MONTH, "swapped immediately, not parked");
@@ -260,7 +261,7 @@ contract PlanChangeTest {
         vm.prank(timelock);
         sub.setTrialPeriod(PRO_MONTH, 7 days);
         _sub(PLUS_MONTH);
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
 
         (bool immediate, uint charged,,) = sub.previewChange(alice, PRO_MONTH);
         _assert(immediate, "immediate");
@@ -269,7 +270,7 @@ contract PlanChangeTest {
         _change(PRO_MONTH);
         _assert(_rcv() == _usdt(PRO_PRICE), "charged in full");
         _assert(!sub.isInTrial(alice), "no trial running");
-        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "a paid cycle from now");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "a paid cycle from now");
     }
 
     /// Having ever subscribed — even to a plan with no trial, even after cancelling and
@@ -300,7 +301,7 @@ contract PlanChangeTest {
         vm.prank(timelock);
         sub.setTrialPeriod(PRO_MONTH, 7 days);
         _sub(GO_MONTH);
-        vm.warp(block.timestamp + 10 days);
+        vm.warp(vm.getBlockTimestamp() + 10 days);
         uint paid = _rcv();
 
         // priced as an ordinary pro-rata upgrade, taking effect at once
@@ -317,7 +318,7 @@ contract PlanChangeTest {
     function test_CancellingDuringTrialStillCostsNothing() public {
         _sub(PLUS_MONTH);
         uint trialEnd = sub.nextChargeableAt(alice);
-        vm.warp(block.timestamp + 1 days);
+        vm.warp(vm.getBlockTimestamp() + 1 days);
         vm.prank(alice);
         sub.cancelSubscription();
         _assert(_rcv() == 0, "no charge");

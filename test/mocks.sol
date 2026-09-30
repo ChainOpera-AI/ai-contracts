@@ -8,6 +8,10 @@ interface Vm {
     function recordLogs() external;
     function getRecordedLogs() external returns (Log[] memory);
     function warp(uint256) external;
+    /// @dev Read the clock through the cheatcode, never `block.timestamp`. Under `via_ir`
+    /// the optimizer reads TIMESTAMP once per function and reuses it, since within a real
+    /// transaction it cannot change -- an assumption `warp` breaks. This call is opaque to it.
+    function getBlockTimestamp() external view returns (uint256);
     function prank(address) external;
     function etch(address, bytes calldata) external;
     function expectRevert(bytes calldata) external;
