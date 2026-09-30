@@ -131,9 +131,12 @@ contract TopUp is ReentrancyGuard {
     constructor(address receiver, uint minDelay, address[] memory proposers, address[] memory executors, address admin) {
         if (receiver == address(0)) revert ZeroAddress();
         if (receiver == address(this)) revert InvalidReceiver();
-        // admin holds TIMELOCK_ADMIN_ROLE and can grant/revoke proposer/executor roles
-        // without the delay, defeating the timelock — must be zero, the timelock self-administers.
-        if (admin != address(0)) revert InvalidTimelockConfig();
+        // `admin`, when non-zero, holds TIMELOCK_ADMIN_ROLE and can grant or revoke every other
+        // role with no delay. That is deliberate here: it keeps an operational key able to
+        // re-shuffle roles directly. It also means the timelock binds only those without that
+        // role — an admin can hand itself PROPOSER and EXECUTOR and push any owner call through,
+        // and strip whoever might have cancelled it. Pass address(0) to have the timelock
+        // administer itself, which is the configuration that makes the delay enforceable.
         // Empty proposers/executors would deadlock the timelock and leave the contract
         // unable to ever execute onlyOwner mutations.
         if (proposers.length == 0 || executors.length == 0) revert InvalidTimelockConfig();

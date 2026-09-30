@@ -2,6 +2,7 @@
 pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/math/Math.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 import "./IPancakeV3PoolState.sol";
 import "./TickMath.sol";
 import "./UsdPricing.sol";
@@ -16,15 +17,28 @@ import "./UsdPricing.sol";
 library CoaiTwapPricing {
     error TWAPNotAvailable();
     error CoaiNotInPool();
+    error QuoteTokenNotEighteenDecimals(address quoteToken, uint8 decimals);
 
     /// @notice Which side of `pool` COAI sits on, which decides whether the pool's price ratio
     /// has to be inverted. Reverts if COAI is not in the pool at all, so a misconfigured pool
     /// address cannot be stored.
+    /// @dev Also refuses a pool whose other side is not an 18-decimal token. toCoaiAmount reads
+    /// that side as an 18-decimal USD stablecoin and has no way to detect otherwise: a 6-decimal
+    /// quote would misprice COAI by twelve orders of magnitude, silently and in whichever
+    /// direction the pool happens to be ordered. Failing here is the only place it can be
+    /// caught, since the pool address is owner-supplied and the price path cannot tell a
+    /// USD quote from any other pair.
     function resolveCoaiIsToken0(IPancakeV3PoolState pool, address coai) internal view returns (bool) {
         address t0 = pool.token0();
-        if (t0 == coai) return true;
-        if (pool.token1() == coai) return false;
-        revert CoaiNotInPool();
+        address t1 = pool.token1();
+        address quote;
+        bool isToken0;
+        if (t0 == coai) { isToken0 = true; quote = t1; }
+        else if (t1 == coai) { isToken0 = false; quote = t0; }
+        else revert CoaiNotInPool();
+        uint8 quoteDecimals = IERC20Metadata(quote).decimals();
+        if (quoteDecimals != 18) revert QuoteTokenNotEighteenDecimals(quote, quoteDecimals);
+        return isToken0;
     }
 
     /// @notice Convert `rawAmount` (USD * 10^USD_DECIMALS) into COAI wei at the pool's TWAP.

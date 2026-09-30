@@ -20,6 +20,7 @@ contract DeploymentGuardsTest {
     address feeCollector = address(0xFEE);
     address terminator = address(0xDEAD);
     address coldWallet = address(0x1111);
+    address operator = address(0x2222);
 
     function setUp() public {
         vm.etch(USDT, type(MockERC20).runtimeCode);
@@ -34,18 +35,48 @@ contract DeploymentGuardsTest {
     function _one(address a) private pure returns (address[] memory r) { r = new address[](1); r[0] = a; }
     function _none() private pure returns (address[] memory r) { r = new address[](0); }
 
-    /// A non-zero admin holds TIMELOCK_ADMIN_ROLE, which grants and revokes every other role
-    /// with no delay. It could give itself PROPOSER and EXECUTOR, strip everyone who might
-    /// cancel, and then push any owner call through — the delay would postpone that, not stop
-    /// it. Both contracts must refuse to deploy that way.
-    function test_NonZeroAdminIsRejected() public {
+    /// A non-zero `admin` is accepted on purpose, and this is exactly what it can do: hold
+    /// TIMELOCK_ADMIN_ROLE, hand itself every other role, and push an owner call through with
+    /// no one able to cancel it. Kept as a test so the scope of that key is written down rather
+    /// than discovered later.
+    function test_NonZeroAdminIsAcceptedAndCanReshuffleRolesDirectly() public {
         address[] memory roles = _one(coldWallet);
+        Subscription sub = new Subscription(receiver, feeCollector, terminator, 0, roles, roles, operator);
+        TimelockController tl = TimelockController(payable(sub.getOwner()));
 
-        vm.expectRevert(abi.encodeWithSignature("InvalidTimelockConfig()"));
-        new Subscription(receiver, feeCollector, terminator, 0, roles, roles, coldWallet);
+        bytes32 adminRole = tl.TIMELOCK_ADMIN_ROLE();
+        bytes32 proposer = tl.PROPOSER_ROLE();
+        bytes32 executor = tl.EXECUTOR_ROLE();
+        bytes32 canceller = tl.CANCELLER_ROLE();
 
-        vm.expectRevert(abi.encodeWithSignature("InvalidTimelockConfig()"));
-        new TopUp(receiver, 0, roles, roles, coldWallet);
+        _assert(tl.hasRole(adminRole, operator), "the admin key holds role admin");
+        _assert(tl.hasRole(adminRole, address(tl)), "the timelock still self-administers too");
+
+        // it can grant itself the remaining roles without any delay
+        vm.prank(operator);
+        tl.grantRole(proposer, operator);
+        vm.prank(operator);
+        tl.grantRole(executor, operator);
+        // and remove anyone who could have cancelled what it proposes
+        vm.prank(operator);
+        tl.revokeRole(canceller, coldWallet);
+        _assert(!tl.hasRole(canceller, coldWallet), "the cold wallet lost its veto");
+
+        // with minDelay at zero that is a one-block takeover of every owner parameter
+        bytes memory payload = abi.encodeWithSignature("setReceiver(address)", operator);
+        vm.prank(operator);
+        tl.schedule(address(sub), 0, payload, bytes32(0), bytes32(0), 0);
+        vm.prank(operator);
+        tl.execute(address(sub), 0, payload, bytes32(0), bytes32(0));
+        _assert(sub.getReceiver() == operator, "owner parameters follow the admin key");
+    }
+
+    /// TopUp takes the same admin argument and behaves the same way.
+    function test_TopUpAlsoAcceptsANonZeroAdmin() public {
+        address[] memory roles = _one(coldWallet);
+        TopUp top = new TopUp(receiver, 0, roles, roles, operator);
+        TimelockController tl = TimelockController(payable(top.getOwner()));
+        _assert(tl.hasRole(tl.TIMELOCK_ADMIN_ROLE(), operator), "admin key carried through");
     }
 
     /// Empty role arrays would leave nobody able to propose or execute, permanently freezing

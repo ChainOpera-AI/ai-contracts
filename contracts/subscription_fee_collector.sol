@@ -349,9 +349,12 @@ contract Subscription is ReentrancyGuard {
     constructor(address receiver, address feeCollector, address subscriptionTerminator, uint minDelay, address[] memory proposers, address[] memory executors, address admin) {
         if (receiver == address(0) || feeCollector == address(0) || subscriptionTerminator == address(0)) revert ZeroAddress();
         if (receiver == address(this)) revert InvalidReceiver();
-        // admin holds TIMELOCK_ADMIN_ROLE and can grant/revoke proposer/executor roles
-        // without the delay, defeating the timelock — must be zero, the timelock self-administers.
-        if (admin != address(0)) revert InvalidTimelockConfig();
+        // `admin`, when non-zero, holds TIMELOCK_ADMIN_ROLE and can grant or revoke every other
+        // role with no delay. That is deliberate here: it keeps an operational key able to
+        // re-shuffle roles directly. It also means the timelock binds only those without that
+        // role — an admin can hand itself PROPOSER and EXECUTOR and push any owner call through,
+        // and strip whoever might have cancelled it. Pass address(0) to have the timelock
+        // administer itself, which is the configuration that makes the delay enforceable.
         // Empty proposers/executors would deadlock the timelock and leave the contract
         // unable to ever execute onlyOwner mutations.
         if (proposers.length == 0 || executors.length == 0) revert InvalidTimelockConfig();
@@ -513,6 +516,10 @@ contract Subscription is ReentrancyGuard {
         // without needing a separate settleDebt tx first. This is also what guarantees a
         // cancelled account can never carry debt afterwards: renewals stop from here on.
         _settleIfDebt(sender, subscriptionType);
+        // A parked downgrade lands inside that settle, so the plan being cancelled may no
+        // longer be the one read on entry. Re-read it, or the event names a plan the account
+        // has already left.
+        subscriptionType = _activeType[sender];
         // Cancelling supersedes a parked downgrade: the slot now holds "ends at period end".
         delete _pendingType[sender];
         _cancelled[sender] = true;

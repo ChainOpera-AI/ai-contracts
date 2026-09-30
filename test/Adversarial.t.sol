@@ -37,6 +37,17 @@ contract ReentrantToken {
     }
 }
 
+/// A stablecoin with six decimals, the way USDC is deployed on most chains.
+contract SixDecimalToken {
+    uint8 public constant decimals = 6;
+    function totalSupply() external pure returns (uint) { return 0; }
+    function balanceOf(address) external pure returns (uint) { return 0; }
+    function transfer(address, uint) external pure returns (bool) { return true; }
+    function allowance(address, address) external pure returns (uint) { return 0; }
+    function approve(address, uint) external pure returns (bool) { return true; }
+    function transferFrom(address, address, uint) external pure returns (bool) { return true; }
+}
+
 contract AdversarialTest {
     Vm constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
 
@@ -223,5 +234,66 @@ contract AdversarialTest {
         vm.prank(alice);
         try sub.renewSelf(alice) { _assert(false, "nor anyone else"); } catch {}
         _assert(_rcv() == MockERC20(USDT).balanceOf(receiver), "no charge happened");
+    }
+
+    /// toCoaiAmount reads the pool's other side as an 18-decimal USD stablecoin. A pool quoted
+    /// in a six-decimal token would misprice COAI by twelve orders of magnitude, and nothing
+    /// downstream could detect it — so the pool has to be refused when it is set.
+    function test_CoaiPoolQuotedInASixDecimalTokenIsRefused() public {
+        SixDecimalToken six = new SixDecimalToken();
+        address badPool = address(0xBADF00D);
+        vm.etch(badPool, type(MockPool).runtimeCode);
+        MockPool(badPool).setTokens(COAI, address(six));
+
+        vm.prank(timelock);
+        vm.expectRevert(abi.encodeWithSignature(
+            "QuoteTokenNotEighteenDecimals(address,uint8)", address(six), uint8(6)));
+        sub.setCOAIPriceFeedAddress(badPool);
+
+        // the good pool is still accepted
+        vm.prank(timelock);
+        sub.setCOAIPriceFeedAddress(POOL);
+        _assert(sub.getCOAIPriceFeedAddress() == POOL, "an 18-decimal quote is fine");
+    }
+
+    /// A pool that does not contain COAI at all is refused before the decimals check.
+    function test_CoaiPoolWithoutCoaiIsRefused() public {
+        address badPool = address(0xBADBEEF);
+        vm.etch(badPool, type(MockPool).runtimeCode);
+        MockPool(badPool).setTokens(USDT, USDC);
+
+        vm.prank(timelock);
+        vm.expectRevert(abi.encodeWithSignature("CoaiNotInPool()"));
+        sub.setCOAIPriceFeedAddress(badPool);
+    }
+
+    /// terminateSubscription must not leave an anchor behind that would put a returning
+    /// account straight back into arrears.
+    function test_TerminateLeavesNoAnchorToTripOverLater() public {
+        vm.prank(alice);
+        sub.subscriptionUSDT(GO_MONTH, address(0));
+        vm.warp(block.timestamp + 10 days);
+        vm.prank(address(0xDEAD));
+        sub.terminateSubscription(alice);
+        _assert(sub.getNextChargeableAt(alice, GO_MONTH) == 0, "anchor cleared");
+
+        // coming back to the same plan starts a clean period from now, not from a stale anchor
+        vm.prank(alice);
+        sub.subscriptionUSDT(GO_MONTH, address(0));
+        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "fresh period");
+        _assert(sub.nextChargeableAt(alice) > block.timestamp, "not born in arrears");
+
+        // and the same holds after bouncing through a second plan
+        vm.prank(address(0xDEAD));
+        sub.terminateSubscription(alice);
+        vm.prank(alice);
+        sub.subscriptionUSDT(PRO_MONTH, address(0));
+        vm.warp(block.timestamp + 5 days);
+        vm.prank(address(0xDEAD));
+        sub.terminateSubscription(alice);
+        _assert(sub.getNextChargeableAt(alice, PRO_MONTH) == 0, "second plan cleared too");
+        vm.prank(alice);
+        sub.subscriptionUSDT(GO_MONTH, address(0));
+        _assert(sub.nextChargeableAt(alice) == block.timestamp + PERIOD, "still clean");
     }
 }
