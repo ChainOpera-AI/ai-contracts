@@ -18,6 +18,11 @@ interface VmScript {
 
 /// Deploy Subscription to BSC.
 ///
+/// Run this with --slow. BSC rejects gapped-nonce transactions from EIP-7702 delegated
+/// accounts, and forge pushes every transaction at once by default, so a delegated deployer
+/// gets its second transaction refused while the first is still pending. --slow waits for
+/// each receipt. IMPL then lets a retry reuse whatever already landed.
+///
 /// Three transactions: a TimelockController (unless one is supplied to reuse), the Subscription
 /// implementation, and an ERC1967 proxy that runs initialize in the same transaction. Only the
 /// proxy address is ever used afterwards.
@@ -28,6 +33,7 @@ interface VmScript {
 ///   FEE_COLLECTOR the hot key that calls renew/renewBatch
 ///   TERMINATOR    the key that can force-cancel a subscription
 ///   IMPORTER      the key allowed to call importAccounts (address(0) to leave imports shut)
+///   IMPL          an already-deployed Subscription implementation to reuse; omit to deploy one
 ///   TIMELOCK      an existing TimelockController to reuse as owner; omit to deploy a new one
 ///   MIN_DELAY     new timelock only: seconds a queued call must wait (0 is allowed)
 ///   PROPOSERS     new timelock only: comma-separated addresses that may queue calls
@@ -55,9 +61,11 @@ contract Deploy {
             ));
         }
 
-        Subscription impl = new Subscription();
+        address impl = vm.envOr("IMPL", address(0));
+        if (impl == address(0)) impl = address(new Subscription());
+
         Subscription sub = Subscription(address(new ERC1967Proxy(
-            address(impl),
+            impl,
             abi.encodeCall(Subscription.initialize, (receiver, feeCollector, terminator, importer, owner_))
         )));
 
@@ -65,7 +73,7 @@ contract Deploy {
 
         // Nothing is left to configure: initialize sets every role, price, period, discount
         // and the trial, and turns the switch on. The deployer holds no power at any point.
-        _report(address(sub), address(impl), owner_, importer);
+        _report(address(sub), impl, owner_, importer);
     }
 
     event Deployed(address proxy, address implementation, address owner, address importerToSet);
