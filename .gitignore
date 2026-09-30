@@ -27,3 +27,6 @@ scripts/merkle-proof/target/
 # Foundry
 out/
 cache/
+
+# Foundry deploy records (broadcast/ holds sender addresses and tx hashes)
+broadcast/
