@@ -23,11 +23,11 @@ contract PlanChangeTest {
     uint constant TRIAL = 3 days;
 
     uint constant USD = 1e8;
-    uint constant GO_PRICE = 5 * USD;
-    uint constant PRO_PRICE = 200 * USD;
+    uint constant GO_PRICE = 499 * USD / 100;
+    uint constant PRO_PRICE = 19999 * USD / 100;
     uint constant PLUS_PRICE = 1999 * USD / 100;
-    uint constant GO_YEAR_PRICE = 48 * USD;
-    uint constant PLUS_YEAR_PRICE = 19188 * USD / 100;
+    uint constant GO_YEAR_PRICE = 4990 * USD / 100;
+    uint constant PLUS_YEAR_PRICE = 19990 * USD / 100;
 
     function _usdt(uint usd18) private pure returns (uint) { return usd18 * 1e18 / USD; }
 
@@ -362,5 +362,42 @@ contract PlanChangeTest {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSignature("NoScheduledChange()"));
         sub.cancelScheduledChange();
+    }
+
+    /// previewChange must refuse exactly what changeSubscription refuses, or a front end can
+    /// show a price for a change that then reverts.
+    function test_PreviewRefusesADelistedDestinationJustLikeTheChangeItself() public {
+        _sub(GO_MONTH);
+        vm.prank(timelock);
+        sub.delistSubscription(PRO_MONTH);
+
+        vm.expectRevert(abi.encodeWithSignature("NotListed(uint256)", PRO_MONTH));
+        sub.previewChange(alice, PRO_MONTH);
+
+        vm.prank(alice);
+        vm.expectRevert(abi.encodeWithSignature("NotListed(uint256)", PRO_MONTH));
+        sub.changeSubscription(PRO_MONTH);
+    }
+
+    /// A renewal that only clears arrears emits no SubscribedXXX, so the inviter it carries
+    /// has to be reported separately or it becomes invisible to indexers.
+    function test_InviterChangeIsObservableOnAnArrearsRenewal() public {
+        vm.prank(alice);
+        sub.subscriptionUSDT(GO_MONTH, address(0xAAA1));
+        _assert(sub.getInviter(alice) == address(0xAAA1), "first inviter recorded");
+
+        vm.warp(sub.nextChargeableAt(alice));
+        vm.recordLogs();
+        vm.prank(alice);
+        sub.subscriptionUSDT(GO_MONTH, address(0xBBB2));
+        _assert(sub.getInviter(alice) == address(0xBBB2), "inviter updated on the renewal");
+
+        bytes32 sig = keccak256("InviterChanged(address,address,address)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bool seen = false;
+        for (uint i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == sig) seen = true;
+        }
+        _assert(seen, "no event reported the new inviter");
     }
 }

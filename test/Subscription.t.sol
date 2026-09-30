@@ -18,7 +18,7 @@ contract SubscriptionTest {
     uint constant PERIOD = 30 days;
     uint constant TRIAL = 3 days;
     uint constant PLUS_PRICE = 1999000000 * 1e18 / 1e8; // $19.99 in 18-dec USDT
-    uint constant GO_PRICE = 500000000 * 1e18 / 1e8;    // $5
+    uint constant GO_PRICE = 499000000 * 1e18 / 1e8;    // $4.99
 
     Subscription sub;
     address timelock;
@@ -42,6 +42,9 @@ contract SubscriptionTest {
         MockERC20(USDT).mint(alice, 1_000_000e18);
         vm.prank(alice);
         MockERC20(USDT).approve(address(sub), type(uint).max);
+        MockERC20(USDC).mint(alice, 1_000_000e18);
+        vm.prank(alice);
+        MockERC20(USDC).approve(address(sub), type(uint).max);
         vm.warp(1_000_000); // move off timestamp 0
     }
 
@@ -151,7 +154,7 @@ contract SubscriptionTest {
         _assert(!sub.startsTrial(alice, PLUS_MONTH), "renewal is not a fresh start");
         uint before = _bal(alice);
         _sub(alice, PLUS_MONTH);
-        _assert(before - _bal(alice) == PLUS_PRICE * 2, "settles due period + pays one more");
+        _assert(before - _bal(alice) == PLUS_PRICE, "one period owed, one period charged");
     }
 
     // --- cancel / restore / plan change ------------------------------------
@@ -278,5 +281,97 @@ contract SubscriptionTest {
 
         _assert(sub.getLockedPeriod(alice) == 7 days, "fresh start picks up the new period");
         _assert(sub.nextChargeableAt(alice) == block.timestamp + 7 days, "and anchors on it");
+    }
+
+    // --- the price list itself ----------------------------------------------
+
+    /// Locks the deployed price table down, and the rule that a year costs ten months.
+    function test_DefaultPriceTable() public view {
+        uint[8] memory expected = [
+            uint(499000000),    // 1 GO_MONTH        $4.99
+            1999000000,         // 2 PLUS_MONTH      $19.99
+            9999000000,         // 3 PREMIUM_MONTH   $99.99
+            19999000000,        // 4 PRO_MONTH       $199.99
+            4990000000,         // 5 GO_YEAR         $49.90
+            19990000000,        // 6 PLUS_YEAR       $199.90
+            99990000000,        // 7 PREMIUM_YEAR    $999.90
+            199990000000        // 8 PRO_YEAR        $1999.90
+        ];
+        for (uint i = 0; i < 8; i++) {
+            _assert(sub.getSubscriptionPrice(i + 1) == expected[i], "price table drifted");
+        }
+        // every yearly plan is exactly ten times its monthly counterpart
+        for (uint m = 1; m <= 4; m++) {
+            _assert(
+                sub.getSubscriptionPrice(m + 4) == sub.getSubscriptionPrice(m) * 10,
+                "a yearly plan is not ten months"
+            );
+        }
+    }
+
+    // --- renewing while in arrears -----------------------------------------
+
+    /// Resubscribing while a period is owed charges exactly that period, not that period
+    /// plus another one. This is the whole point of the arrears branch in _activate.
+    function test_ResubscribingInArrearsChargesOnlyWhatIsOwed() public {
+        _sub(alice, GO_MONTH);
+        uint next = sub.nextChargeableAt(alice);
+        vm.warp(next + 3 days);              // one period owed, three days late
+
+        uint before = _bal(alice);
+        _sub(alice, GO_MONTH);
+        _assert(before - _bal(alice) == GO_PRICE, "exactly one period");
+        _assert(sub.nextChargeableAt(alice) == next + PERIOD, "anchor advanced by exactly one");
+        _assert(sub.nextChargeableAt(alice) > block.timestamp, "and is no longer in arrears");
+    }
+
+    /// Several periods owed: every one of them is charged, and not one more.
+    function test_ResubscribingClearsEveryOwedPeriodAndNoMore() public {
+        _sub(alice, GO_MONTH);
+        uint next = sub.nextChargeableAt(alice);
+        vm.warp(next + 2 * PERIOD + 1 days); // three periods owed
+
+        uint before = _bal(alice);
+        _sub(alice, GO_MONTH);
+        _assert(before - _bal(alice) == GO_PRICE * 3, "three owed, three charged");
+        _assert(sub.nextChargeableAt(alice) == next + 3 * PERIOD, "anchor advanced by three");
+    }
+
+    /// The case seen on chain: a trial lapses, the fee collector misses it, and the user
+    /// renews by hand. One period was owed, so one period is charged.
+    function test_RenewingAfterALapsedTrialChargesOnePeriod() public {
+        _sub(alice, PLUS_MONTH);                 // opens the 3-day trial, charges nothing
+        uint trialEnd = sub.nextChargeableAt(alice);
+        _assert(_bal(receiver) == 0, "trial is free");
+
+        vm.warp(trialEnd + 3 days);              // trial over, nobody called renew
+        uint before = _bal(alice);
+        _sub(alice, PLUS_MONTH);
+
+        _assert(before - _bal(alice) == PLUS_PRICE, "one period, not two");
+        _assert(sub.nextChargeableAt(alice) == trialEnd + PERIOD, "anchor is one period past the trial");
+    }
+
+    /// Arrears are settled in the token the account owed them in; the token it renews with
+    /// takes over from there.
+    function test_RenewingInArrearsCanSwitchPayToken() public {
+        _sub(alice, GO_MONTH);                   // subscribed in USDT
+        uint next = sub.nextChargeableAt(alice);
+        vm.warp(next);
+
+        uint usdtBefore = _bal(alice);
+        uint usdcBefore = MockERC20(USDC).balanceOf(alice);
+        vm.prank(alice);
+        sub.subscriptionUSDC(GO_MONTH, address(0));
+
+        _assert(usdtBefore - _bal(alice) == GO_PRICE, "the debt was paid in USDT");
+        _assert(MockERC20(USDC).balanceOf(alice) == usdcBefore, "USDC was not touched");
+        _assert(sub.getActivePayToken(alice) == 3, "but future charges are USDC");
+
+        // and the next renewal does come out of USDC
+        vm.warp(sub.nextChargeableAt(alice));
+        vm.prank(feeCollector);
+        sub.renew(alice);
+        _assert(usdcBefore - MockERC20(USDC).balanceOf(alice) == GO_PRICE, "renewed in USDC");
     }
 }

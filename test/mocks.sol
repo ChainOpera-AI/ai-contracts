@@ -4,6 +4,9 @@ pragma solidity ^0.8.20;
 /// @dev The subset of forge's cheatcodes these tests use. Declared here rather than pulled in
 /// from forge-std so the suite has no dependency beyond what package.json already installs.
 interface Vm {
+    struct Log { bytes32[] topics; bytes data; address emitter; }
+    function recordLogs() external;
+    function getRecordedLogs() external returns (Log[] memory);
     function warp(uint256) external;
     function prank(address) external;
     function etch(address, bytes calldata) external;

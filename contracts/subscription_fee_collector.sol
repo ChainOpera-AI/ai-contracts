@@ -141,6 +141,14 @@ contract Subscription is ReentrancyGuard {
         uint indexed subscriptionType,
         uint cancelledAt
     );
+    /// @dev The referrer on record changed. SubscribedUSDT/COAI/USDC also carry the inviter,
+    /// but a renewal that only clears arrears emits neither, so this is the one event that
+    /// fires on every path that can change it.
+    event InviterChanged(
+        address indexed account,
+        address indexed previous_inviter,
+        address indexed new_inviter
+    );
     event SubscriptionRestored(
         address indexed account,
         uint indexed subscriptionType,
@@ -312,14 +320,15 @@ contract Subscription is ReentrancyGuard {
     uint constant SUB_TYPE_PRO_YEAR      = 8;
 
     // Prices in USD * 10^USD_DECIMALS (USD * 1e8).
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH      = 500000000;       // $5
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_GO_MONTH      = 499000000;       // $4.99
     uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_MONTH    = 1999000000;      // $19.99
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH = 10000000000;     // $100
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH     = 20000000000;     // $200
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR       = 4800000000;      // $48 = $4 * 12
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR     = 19188000000;     // $191.88 = $15.99 * 12
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR  = 96000000000;     // $960 = $80 * 12
-    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR      = 192000000000;    // $1920 = $160 * 12
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_MONTH = 9999000000;      // $99.99
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_MONTH     = 19999000000;     // $199.99
+    // Yearly plans are ten times the monthly price, i.e. two months free over paying monthly.
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_GO_YEAR       = 4990000000;      // $49.90 = $4.99 * 10
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PLUS_YEAR     = 19990000000;     // $199.90 = $19.99 * 10
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PREMIUM_YEAR  = 99990000000;     // $999.90 = $99.99 * 10
+    uint constant DEFAULT_SUBSCRIPTION_AMOUNT_PRO_YEAR      = 199990000000;    // $1999.90 = $199.99 * 10
     // Defined by UsdPricing; aliased so the many call sites below stay readable.
     uint constant DISCOUNT_BASE = UsdPricing.DISCOUNT_BASE;
     uint constant DEFAULT_DISCOUNT_COAI = 900; // 10% off, applied only to COAI payments by default
@@ -602,6 +611,9 @@ contract Subscription is ReentrancyGuard {
         if (newType == currentType) revert SameSubscriptionType();
         if (_subscriptionPrices[newType] == 0) revert InvalidSubscriptionType(newType);
         if (_subscriptionPeriods[newType] == 0) revert UnknownPeriod();
+        // Same admission test as changeSubscription, so a quote is never given for a change
+        // that would then be refused.
+        if (!_subscriptionListed[newType]) revert NotListed(newType);
 
         if (block.timestamp < _trialEndsAt[account]) {
             // Leaving the trial ends it and bills a whole period of the new plan right away.
@@ -996,9 +1008,12 @@ contract Subscription is ReentrancyGuard {
             emit TrialStarted(sender, subscriptionType, inviter, PAY_TOKEN_USDT, _nextChargeableAt[sender][subscriptionType]);
             return;
         }
+        // Arrears clear through _activate and are charged there, so nothing is priced or
+        // transferred here. Quoting first would also make a COAI renewal fail whenever the
+        // TWAP is unavailable, even though settling needs no fresh quote for a stablecoin payer.
+        if (_activate(sender, subscriptionType, PAY_TOKEN_USDT)) return;
         uint price = _priceOf(subscriptionType, PAY_TOKEN_USDT);
         uint requiredUSDTAmount = _calculateAmountUSDT(price);
-        _activate(sender, subscriptionType, PAY_TOKEN_USDT);
         emit SubscribedUSDT(sender, subscriptionType, inviter, price, requiredUSDTAmount);
         _usdt.safeTransferFrom(sender, _receiver, requiredUSDTAmount);
     }
@@ -1015,9 +1030,12 @@ contract Subscription is ReentrancyGuard {
             emit TrialStarted(sender, subscriptionType, inviter, PAY_TOKEN_COAI, _nextChargeableAt[sender][subscriptionType]);
             return;
         }
+        // Arrears clear through _activate and are charged there, so nothing is priced or
+        // transferred here. Quoting first would also make a COAI renewal fail whenever the
+        // TWAP is unavailable, even though settling needs no fresh quote for a stablecoin payer.
+        if (_activate(sender, subscriptionType, PAY_TOKEN_COAI)) return;
         uint price = _priceOf(subscriptionType, PAY_TOKEN_COAI);
         uint requiredCOAIAmount = _calculateAmountCOAI(price);
-        _activate(sender, subscriptionType, PAY_TOKEN_COAI);
         emit SubscribedCOAI(sender, subscriptionType, inviter, price, requiredCOAIAmount);
         _coai.safeTransferFrom(sender, _receiver, requiredCOAIAmount);
     }
@@ -1034,9 +1052,12 @@ contract Subscription is ReentrancyGuard {
             emit TrialStarted(sender, subscriptionType, inviter, PAY_TOKEN_USDC, _nextChargeableAt[sender][subscriptionType]);
             return;
         }
+        // Arrears clear through _activate and are charged there, so nothing is priced or
+        // transferred here. Quoting first would also make a COAI renewal fail whenever the
+        // TWAP is unavailable, even though settling needs no fresh quote for a stablecoin payer.
+        if (_activate(sender, subscriptionType, PAY_TOKEN_USDC)) return;
         uint price = _priceOf(subscriptionType, PAY_TOKEN_USDC);
         uint requiredUSDCAmount = _calculateAmountUSDC(price);
-        _activate(sender, subscriptionType, PAY_TOKEN_USDC);
         emit SubscribedUSDC(sender, subscriptionType, inviter, price, requiredUSDCAmount);
         _usdc.safeTransferFrom(sender, _receiver, requiredUSDCAmount);
     }
@@ -1046,7 +1067,10 @@ contract Subscription is ReentrancyGuard {
     /// the stored value, so users can switch their referrer on a later subscribe call.
     function _recordInviter(address sender, address inviter) private {
         if (inviter == sender) revert InvalidInviter();
+        address previous = _inviters[sender];
+        if (previous == inviter) return; // unchanged: no write, no event, no gas
         _inviters[sender] = inviter;
+        emit InviterChanged(sender, previous, inviter);
     }
 
     function _renew(address account) private {
@@ -1119,11 +1143,13 @@ contract Subscription is ReentrancyGuard {
         if (block.timestamp < previousNext) revert NotDueYet(previousNext);
     }
 
-    function _settleIfDebt(address account, uint subscriptionType) private {
+    /// @return settled True when arrears existed and have just been charged.
+    function _settleIfDebt(address account, uint subscriptionType) private returns (bool settled) {
         uint next = _nextChargeableAt[account][subscriptionType];
-        if (next == 0) return; // not subscribed to this type
-        if (block.timestamp < next) return; // not in debt
+        if (next == 0) return false; // not subscribed to this type
+        if (block.timestamp < next) return false; // not in debt
         _settle(account, subscriptionType);
+        return true;
     }
 
     function _settle(address account, uint subscriptionType) private {
@@ -1158,12 +1184,14 @@ contract Subscription is ReentrancyGuard {
         }
     }
 
-    /// @return trialStarted True when this subscribe opened a free trial and therefore
-    /// charged nothing — the caller must skip its transfer and emit TrialStarted instead.
-    function _activate(address account, uint subscriptionType, uint8 payToken) private returns (bool trialStarted) {
+    /// @return chargeHandled True when this call leaves the caller nothing to charge. Either a
+    /// free trial opened, or the account was in arrears and clearing them was the whole of what
+    /// it asked for — _settle has already taken payment for every period owed and emitted
+    /// DebtSettled. Charging again on top would bill two periods for one renewal.
+    function _activate(address account, uint subscriptionType, uint8 payToken) private returns (bool chargeHandled) {
         // Must be read BEFORE the cancelled-account cleanup below, which clears the very
         // state _startsTrial inspects.
-        trialStarted = _startsTrial(account, subscriptionType);
+        bool trialStarted = _startsTrial(account, subscriptionType);
         uint previous = _activeType[account];
         if (previous != 0) {
             if (_cancelled[account]) {
@@ -1178,10 +1206,20 @@ contract Subscription is ReentrancyGuard {
                     emit SubscriptionSwitched(account, previous, subscriptionType);
                 }
             } else {
-                // Active resubscribe. _requireDue guarantees the type is unchanged and the
-                // period is up, so settle every period accrued since the anchor — the caller
-                // cannot walk away from unpaid periods — and this call pays for one more.
-                _settleIfDebt(account, previous);
+                // Active resubscribe, which _requireDue only admits once the period is up —
+                // so the account is always in arrears here. Settling them is exactly what the
+                // caller asked for; charging another period on top of that would bill two
+                // periods for one renewal. (This branch once served plan switching, where
+                // "clear the old plan, then buy the new one's first period" was right. Direct
+                // switching is gone, and with it the reason to charge twice.)
+                if (_settleIfDebt(account, previous)) {
+                    // Arrears are charged in the pay token the account held; anything from
+                    // here on uses the one it just renewed with.
+                    _activePayToken[account] = payToken;
+                    return true;
+                }
+                // Unreachable while the invariant holds. If it ever is reached, fall through
+                // and charge normally rather than letting a renewal through for free.
             }
         }
         _activeType[account] = subscriptionType;
@@ -1210,8 +1248,8 @@ contract Subscription is ReentrancyGuard {
             return true;
         }
         // Fresh start (first subscribe, post-terminate, or after a cancelled period elapsed):
-        // anchor at now + period. Existing anchor (same-type resubscribe once due): advance
-        // by one period.
+        // anchor at now + period. The `next + period` arm is the defensive path noted above;
+        // in normal operation an account with a live anchor leaves through the arrears branch.
         _nextChargeableAt[account][subscriptionType] = next == 0 ? block.timestamp + period : next + period;
         return false;
     }
