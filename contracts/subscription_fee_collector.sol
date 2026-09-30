@@ -52,6 +52,10 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     error AlreadyListed(uint subscriptionType);
     error InvalidInviter();
     error ImportAlreadyClosed();
+    error NotImporter(
+        address importer,
+        address caller
+    );
 
     event SubscribedUSDT(
         address indexed account,
@@ -118,6 +122,9 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     );
     event SubscriptionTerminatorChanged(
         address indexed new_subscriptionTerminator
+    );
+    event ImporterChanged(
+        address indexed new_importer
     );
     event SubscriptionTerminated(
         address indexed account,
@@ -315,6 +322,11 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     mapping(address => address) private _inviters;
     // Set once by closeImport(); after that importAccounts is dead for good.
     bool private _importClosed;
+    // The only address importAccounts answers to. Owner-settable, zero by default, which
+    // means imports are shut until the owner names someone. Deliberately not the owner
+    // itself: migration is a long grind of batched transactions and the owner is a
+    // timelock, so it gets its own hot key that the owner can revoke at any moment.
+    address private _importer;
 
     // subscriptionType id constants. Tier order (low → high): GO < PLUS < PREMIUM < PRO.
     // IDs 1-4 are monthly plans in tier order, 5-8 are yearly plans in tier order.
@@ -976,6 +988,12 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         _;
     }
 
+    modifier onlyImporter() {
+        address caller = msg.sender;
+        if (caller != _importer) revert NotImporter(_importer, caller);
+        _;
+    }
+
     modifier onlyFeeCollector() {
         if (msg.sender != _feeCollector) revert NotFeeCollector(_feeCollector, msg.sender);
         _;
@@ -1424,13 +1442,14 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     event AccountsImported(uint count, address indexed by);
     event ImportClosed(uint closedAt);
 
-    /// @notice Copy account state in from a previous deployment. Owner-only, and it writes the
+    /// @notice Copy account state in from a previous deployment. Callable only by the importer
+    /// address the owner has named, and it writes the
     /// same fields a subscribe would, so the imported account behaves exactly like a native one:
     /// renew, settle, cancel, restore and changeSubscription all work off these values.
     /// @dev Rows with subscriptionType 0 are skipped, so a batch can carry gaps. This does NOT
     /// move any money — it only reproduces bookkeeping. Verify the source values first: nothing
     /// here can tell a correct anchor from a wrong one.
-    function importAccounts(ImportedAccount[] calldata rows) onlyOwner external {
+    function importAccounts(ImportedAccount[] calldata rows) onlyImporter external {
         if (_importClosed) revert ImportAlreadyClosed();
         uint written;
         for (uint i = 0; i < rows.length; i++) {
@@ -1451,13 +1470,25 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         emit AccountsImported(written, msg.sender);
     }
 
+    function getImporter() external view returns (address) {
+        return _importer;
+    }
+
+    /// @notice Name the address allowed to call importAccounts. Zero shuts imports off
+    /// without closing them for good, so the owner can park the role between batches.
+    function setImporter(address new_importer) onlyOwner external {
+        _importer = new_importer;
+        emit ImporterChanged(new_importer);
+    }
+
     function isImportClosed() external view returns (bool) {
         return _importClosed;
     }
 
     /// @notice Permanently disable importAccounts. Optional — nothing forces you to call it —
-    /// but once the migration is done this removes the owner's ability to rewrite any account's
-    /// billing state, and it cannot be undone.
+    /// but once the migration is done this removes the importer's ability to rewrite any
+    /// account's billing state, for good, no matter who the owner later names. It cannot
+    /// be undone.
     function closeImport() onlyOwner external {
         _importClosed = true;
         emit ImportClosed(block.timestamp);
@@ -1465,5 +1496,5 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
 
     /// @dev Reserved so future versions can add state without disturbing the layout above.
     /// Adding a variable means taking one slot from here, never appending past it.
-    uint256[40] private __gap;
+    uint256[39] private __gap;
 }

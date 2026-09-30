@@ -34,6 +34,7 @@ contract UpgradeTest {
     address terminator = address(0xDEAD);
     address alice = address(0xA11CE);
     address mallory = address(0xBAD);
+    address importer = address(0x114807);
 
     function setUp() public {
         vm.etch(USDT, type(MockERC20).runtimeCode);
@@ -49,6 +50,8 @@ contract UpgradeTest {
         vm.prank(alice);
         MockERC20(USDT).approve(address(sub), type(uint).max);
         vm.warp(1_000_000);
+        vm.prank(timelock);
+        sub.setImporter(importer);
     }
 
     function _assert(bool ok, string memory what) private pure { require(ok, what); }
@@ -145,7 +148,7 @@ contract UpgradeTest {
             everSubscribed: true,
             inviter: address(0xAAA1)
         });
-        vm.prank(timelock);
+        vm.prank(importer);
         sub.importAccounts(rows);
 
         _assert(sub.getActiveType(alice) == PLUS_MONTH, "type imported");
@@ -177,7 +180,7 @@ contract UpgradeTest {
             nextChargeableAt: vm.getBlockTimestamp() + 1 days, pendingType: 0, trialEndsAt: 0,
             cancelled: false, everSubscribed: true, inviter: address(0)
         });
-        vm.prank(timelock);
+        vm.prank(importer);
         sub.importAccounts(rows);
         _assert(sub.getActiveType(mallory) == 0, "blank row skipped");
         _assert(sub.getActiveType(alice) == GO_MONTH, "real row written");
@@ -187,21 +190,66 @@ contract UpgradeTest {
         bad[0] = rows[1];
         bad[0].account = mallory;
         bad[0].lockedPeriod = 0;
-        vm.prank(timelock);
+        vm.prank(importer);
         vm.expectRevert(abi.encodeWithSignature("UnknownPeriod()"));
         sub.importAccounts(bad);
     }
 
-    function test_OnlyOwnerCanImport() public {
-        Subscription.ImportedAccount[] memory rows = new Subscription.ImportedAccount[](1);
+    function _oneRow() private view returns (Subscription.ImportedAccount[] memory rows) {
+        rows = new Subscription.ImportedAccount[](1);
         rows[0] = Subscription.ImportedAccount({
             account: alice, subscriptionType: GO_MONTH, payToken: 1, lockedPeriod: uint32(PERIOD),
             nextChargeableAt: vm.getBlockTimestamp() + 1 days, pendingType: 0, trialEndsAt: 0,
             cancelled: false, everSubscribed: true, inviter: address(0)
         });
+    }
+
+    function test_OnlyTheNamedImporterCanImport() public {
+        Subscription.ImportedAccount[] memory rows = _oneRow();
+
+        vm.prank(mallory);
+        vm.expectRevert(abi.encodeWithSignature("NotImporter(address,address)", importer, mallory));
+        sub.importAccounts(rows);
+
+        // the owner names the importer but is not one itself, so importing is a separate power
+        vm.prank(timelock);
+        vm.expectRevert(abi.encodeWithSignature("NotImporter(address,address)", importer, timelock));
+        sub.importAccounts(rows);
+
+        _assert(sub.getActiveType(alice) == 0, "nothing written");
+    }
+
+    function test_OwnerCanRotateAndRevokeTheImporter() public {
+        _assert(sub.getImporter() == importer, "named in setUp");
+
+        address successor = address(0x50CC);
+        vm.prank(timelock);
+        sub.setImporter(successor);
+        _assert(sub.getImporter() == successor, "rotated");
+
+        Subscription.ImportedAccount[] memory rows = _oneRow();
+        vm.prank(importer);
+        vm.expectRevert(abi.encodeWithSignature("NotImporter(address,address)", successor, importer));
+        sub.importAccounts(rows);
+
+        vm.prank(successor);
+        sub.importAccounts(rows);
+        _assert(sub.getActiveType(alice) == GO_MONTH, "successor can import");
+
+        // zero parks the role: imports stop, but closeImport has not been spent
+        vm.prank(timelock);
+        sub.setImporter(address(0));
+        vm.prank(successor);
+        vm.expectRevert(abi.encodeWithSignature("NotImporter(address,address)", address(0), successor));
+        sub.importAccounts(rows);
+        _assert(!sub.isImportClosed(), "parked, not closed");
+    }
+
+    function test_OnlyOwnerCanNameTheImporter() public {
         vm.prank(mallory);
         vm.expectRevert(abi.encodeWithSignature("NotOwner(address,address)", timelock, mallory));
-        sub.importAccounts(rows);
+        sub.setImporter(mallory);
+        _assert(sub.getImporter() == importer, "unchanged");
     }
 
     function test_CloseImportIsPermanent() public {
@@ -216,7 +264,7 @@ contract UpgradeTest {
             nextChargeableAt: vm.getBlockTimestamp() + 1 days, pendingType: 0, trialEndsAt: 0,
             cancelled: false, everSubscribed: true, inviter: address(0)
         });
-        vm.prank(timelock);
+        vm.prank(importer);
         vm.expectRevert(abi.encodeWithSignature("ImportAlreadyClosed()"));
         sub.importAccounts(rows);
     }
