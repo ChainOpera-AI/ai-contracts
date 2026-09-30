@@ -106,7 +106,7 @@ contract InvariantTest {
 
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), address(0), 0, roles, roles, address(0));
 
         for (uint i = 0; i < ACTORS; i++) {
             address a = address(uint160(0xA000 + i));

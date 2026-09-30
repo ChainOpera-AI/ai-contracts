@@ -44,14 +44,12 @@ contract UpgradeTest {
         MockPool(POOL).setTokens(COAI, USDT);
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = deploySubscription(receiver, feeCollector, terminator, 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, terminator, importer, 0, roles, roles, address(0));
         timelock = sub.getOwner();
         MockERC20(USDT).mint(alice, 1_000_000e18);
         vm.prank(alice);
         MockERC20(USDT).approve(address(sub), type(uint).max);
         vm.warp(1_000_000);
-        vm.prank(timelock);
-        sub.setImporter(importer);
     }
 
     function _assert(bool ok, string memory what) private pure { require(ok, what); }
@@ -64,7 +62,7 @@ contract UpgradeTest {
 
         vm.prank(mallory);
         vm.expectRevert(bytes("Initializable: contract is already initialized"));
-        sub.initialize(mallory, mallory, mallory, mallory);
+        sub.initialize(mallory, mallory, mallory, mallory, mallory);
     }
 
     /// The implementation must be inert on its own, or someone could initialize it directly
@@ -73,7 +71,7 @@ contract UpgradeTest {
         Subscription impl = new Subscription();
         vm.prank(mallory);
         vm.expectRevert(bytes("Initializable: contract is already initialized"));
-        impl.initialize(mallory, mallory, mallory, mallory);
+        impl.initialize(mallory, mallory, mallory, mallory, mallory);
     }
 
     // --- upgrading ----------------------------------------------------------
@@ -202,6 +200,11 @@ contract UpgradeTest {
             nextChargeableAt: vm.getBlockTimestamp() + 1 days, pendingType: 0, trialEndsAt: 0,
             cancelled: false, everSubscribed: true, inviter: address(0)
         });
+    }
+
+    function test_InitializeNamesTheImporter() public {
+        _assert(sub.getImporter() == importer, "named at initialize, no follow-up call needed");
+        _assert(!sub.isImportClosed(), "and imports are open");
     }
 
     function test_OnlyTheNamedImporterCanImport() public {

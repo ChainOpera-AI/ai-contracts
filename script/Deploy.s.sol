@@ -27,7 +27,7 @@ interface VmScript {
 ///   RECEIVER      where subscription payments land
 ///   FEE_COLLECTOR the hot key that calls renew/renewBatch
 ///   TERMINATOR    the key that can force-cancel a subscription
-///   IMPORTER      the hot key allowed to call importAccounts (address(0) to leave imports shut)
+///   IMPORTER      the key allowed to call importAccounts (address(0) to leave imports shut)
 ///   TIMELOCK      an existing TimelockController to reuse as owner; omit to deploy a new one
 ///   MIN_DELAY     new timelock only: seconds a queued call must wait (0 is allowed)
 ///   PROPOSERS     new timelock only: comma-separated addresses that may queue calls
@@ -58,13 +58,13 @@ contract Deploy {
         Subscription impl = new Subscription();
         Subscription sub = Subscription(address(new ERC1967Proxy(
             address(impl),
-            abi.encodeCall(Subscription.initialize, (receiver, feeCollector, terminator, owner_))
+            abi.encodeCall(Subscription.initialize, (receiver, feeCollector, terminator, importer, owner_))
         )));
 
         vm.stopBroadcast();
 
-        // Naming the importer is an owner call, so it goes through the timelock afterwards
-        // rather than here -- the deployer has no power over the contract at any point.
+        // Nothing is left to configure: initialize sets every role, price, period, discount
+        // and the trial, and turns the switch on. The deployer holds no power at any point.
         _report(address(sub), address(impl), owner_, importer);
     }
 

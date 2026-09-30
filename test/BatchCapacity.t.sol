@@ -26,7 +26,7 @@ contract BatchCapacityTest {
         MockPool(POOL).setTokens(COAI, USDT);
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), address(0), 0, roles, roles, address(0));
         vm.warp(1_000_000);
     }
 

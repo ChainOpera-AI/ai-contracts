@@ -43,7 +43,7 @@ contract DeploymentGuardsTest {
     /// than discovered later.
     function test_NonZeroAdminIsAcceptedAndCanReshuffleRolesDirectly() public {
         address[] memory roles = _one(coldWallet);
-        Subscription sub = deploySubscription(receiver, feeCollector, terminator, 0, roles, roles, operator);
+        Subscription sub = deploySubscription(receiver, feeCollector, terminator, address(0), 0, roles, roles, operator);
         TimelockController tl = TimelockController(payable(sub.getOwner()));
 
         bytes32 adminRole = tl.TIMELOCK_ADMIN_ROLE();
@@ -86,7 +86,7 @@ contract DeploymentGuardsTest {
     function test_ZeroOwnerIsRejected() public {
         address impl = address(new Subscription());
         vm.expectRevert(abi.encodeWithSignature("ZeroAddress()"));
-        new ERC1967Proxy(impl, subscriptionInitCall(receiver, feeCollector, terminator, address(0)));
+        new ERC1967Proxy(impl, subscriptionInitCall(receiver, feeCollector, terminator, address(0), address(0)));
     }
 
     /// Timelock configuration is no longer this contract's concern — it takes whatever owner it
@@ -100,7 +100,7 @@ contract DeploymentGuardsTest {
         _assert(!deadlocked.hasRole(deadlocked.PROPOSER_ROLE(), coldWallet), "nobody can propose");
 
         // and Subscription accepts it, because it cannot tell
-        Subscription sub = deploySubscription(receiver, feeCollector, terminator, 0, none, some, address(0));
+        Subscription sub = deploySubscription(receiver, feeCollector, terminator, address(0), 0, none, some, address(0));
         _assert(sub.getOwner() != address(0), "deployed against a deadlocked timelock");
     }
 
@@ -108,7 +108,7 @@ contract DeploymentGuardsTest {
     /// outside address does, so roles can only be changed through a delayed proposal.
     function test_TimelockSelfAdministersWhenDeployedCorrectly() public {
         address[] memory roles = _one(coldWallet);
-        Subscription sub = deploySubscription(receiver, feeCollector, terminator, 2 days, roles, roles, address(0));
+        Subscription sub = deploySubscription(receiver, feeCollector, terminator, address(0), 2 days, roles, roles, address(0));
         TimelockController tl = TimelockController(payable(sub.getOwner()));
 
         bytes32 adminRole = tl.TIMELOCK_ADMIN_ROLE();
@@ -131,7 +131,7 @@ contract DeploymentGuardsTest {
     /// nothing after deployment.
     function test_DeployerRetainsNoPower() public {
         address[] memory roles = _one(coldWallet);
-        Subscription sub = deploySubscription(receiver, feeCollector, terminator, 1 days, roles, roles, address(0));
+        Subscription sub = deploySubscription(receiver, feeCollector, terminator, address(0), 1 days, roles, roles, address(0));
 
         _assert(sub.getOwner() != address(this), "deployer is not the owner");
         vm.expectRevert(abi.encodeWithSignature("NotOwner(address,address)", sub.getOwner(), address(this)));

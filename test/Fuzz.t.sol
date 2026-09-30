@@ -53,7 +53,7 @@ contract FuzzTest {
         VariableTickPool(POOL).setTokens(COAI, USDT);
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), address(0), 0, roles, roles, address(0));
         timelock = sub.getOwner();
         MockERC20(USDT).mint(alice, 1e30);
         MockERC20(COAI).mint(alice, 1e30);

@@ -37,7 +37,7 @@ contract SubscriptionTest {
 
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = deploySubscription(receiver, feeCollector, terminator, 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, terminator, address(0), 0, roles, roles, address(0));
         timelock = sub.getOwner();
 
         MockERC20(USDT).mint(alice, 1_000_000e18);

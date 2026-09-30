@@ -12,9 +12,10 @@ function subscriptionInitCall(
     address receiver,
     address feeCollector,
     address terminator,
+    address importer,
     address owner_
 ) pure returns (bytes memory) {
-    return abi.encodeCall(Subscription.initialize, (receiver, feeCollector, terminator, owner_));
+    return abi.encodeCall(Subscription.initialize, (receiver, feeCollector, terminator, importer, owner_));
 }
 
 /// Deploy Subscription the way production does: an implementation contract behind an ERC1967
@@ -27,6 +28,7 @@ function deploySubscription(
     address receiver,
     address feeCollector,
     address terminator,
+    address importer,
     uint minDelay,
     address[] memory proposers,
     address[] memory executors,
@@ -34,6 +36,6 @@ function deploySubscription(
 ) returns (Subscription) {
     TimelockController tl = new TimelockController(minDelay, proposers, executors, admin);
     Subscription impl = new Subscription();
-    bytes memory data = subscriptionInitCall(receiver, feeCollector, terminator, address(tl));
+    bytes memory data = subscriptionInitCall(receiver, feeCollector, terminator, importer, address(tl));
     return Subscription(address(new ERC1967Proxy(address(impl), data)));
 }

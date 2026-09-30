@@ -322,10 +322,10 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     mapping(address => address) private _inviters;
     // Set once by closeImport(); after that importAccounts is dead for good.
     bool private _importClosed;
-    // The only address importAccounts answers to. Owner-settable, zero by default, which
-    // means imports are shut until the owner names someone. Deliberately not the owner
-    // itself: migration is a long grind of batched transactions and the owner is a
-    // timelock, so it gets its own hot key that the owner can revoke at any moment.
+    // The only address importAccounts answers to. Set at initialize and changeable by the
+    // owner thereafter; zero means imports are shut. Deliberately not the owner itself:
+    // migration is a long grind of batched transactions and the owner is a timelock, so it
+    // gets its own key that the owner can revoke at any moment.
     address private _importer;
 
     // subscriptionType id constants. Tier order (low → high): GO < PLUS < PREMIUM < PRO.
@@ -383,7 +383,13 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     /// lives in the initcode, but an initializer's code is runtime code and it cost 8.7KB of
     /// the 24KB deployable limit. Passing the address in also means an existing timelock or a
     /// multisig can be reused.
-    function initialize(address receiver, address feeCollector, address subscriptionTerminator, address owner_) public initializer {
+    function initialize(
+        address receiver,
+        address feeCollector,
+        address subscriptionTerminator,
+        address importer,
+        address owner_
+    ) public initializer {
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
         if (receiver == address(0) || feeCollector == address(0) || subscriptionTerminator == address(0)) revert ZeroAddress();
@@ -393,6 +399,9 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         emit FeeCollectorChanged(feeCollector);
         _subscriptionTerminator = subscriptionTerminator;
         emit SubscriptionTerminatorChanged(subscriptionTerminator);
+        // Deliberately not zero-checked: zero is the meaningful "imports are shut" value.
+        _importer = importer;
+        emit ImporterChanged(importer);
         _twapInterval = TWAP_INTERVAL;
         _usdt = ERC20(DEFAULT_USDT);
         _usdtDecimals = ERC20(DEFAULT_USDT).decimals();
