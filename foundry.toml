@@ -15,3 +15,10 @@ remappings = [
     "@openzeppelin/=node_modules/@openzeppelin/",
     "@chainlink/=node_modules/@chainlink/",
 ]
+
+[rpc_endpoints]
+bsc = "https://bsc-dataseed.binance.org"
+
+[etherscan]
+# BscScan reads Etherscan V2 keys; export ETHERSCAN_API_KEY before `--verify`.
+bsc = { key = "${ETHERSCAN_API_KEY}", chain = 56 }
