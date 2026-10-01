@@ -12,6 +12,7 @@ interface VmScript {
     function envAddress(string calldata name, string calldata delim) external view returns (address[] memory);
     function envUint(string calldata name) external view returns (uint256);
     function envOr(string calldata name, address defaultValue) external view returns (address);
+    function envOr(string calldata name, uint256 defaultValue) external view returns (uint256);
     function startBroadcast() external;
     function stopBroadcast() external;
 }
@@ -52,12 +53,25 @@ contract Deploy {
         address terminator = vm.envAddress("TERMINATOR");
         address importer = vm.envOr("IMPORTER", address(0));
         address owner_ = vm.envOr("OWNER", vm.envOr("TIMELOCK", address(0)));
+        // Sentinel rather than a default, so "unset" is distinguishable from "set to 0", and a
+        // config left over in the shell from a different deployment cannot silently win.
+        uint minDelay = vm.envOr("MIN_DELAY", type(uint256).max);
+        bool buildTimelock = minDelay != type(uint256).max;
+        require(
+            !(owner_ != address(0) && buildTimelock),
+            "OWNER/TIMELOCK and MIN_DELAY are both set. Sourcing two env files in one shell leaves "
+            "the first one's variables exported. Unset whichever you do not want, or start a new shell."
+        );
+        require(
+            owner_ != address(0) || buildTimelock,
+            "Set OWNER to an existing owner, or MIN_DELAY/PROPOSERS/EXECUTORS/TIMELOCK_ADMIN to deploy a timelock."
+        );
 
         vm.startBroadcast();
 
         if (owner_ == address(0)) {
             owner_ = address(new TimelockController(
-                vm.envUint("MIN_DELAY"),
+                minDelay,
                 vm.envAddress("PROPOSERS", ","),
                 vm.envAddress("EXECUTORS", ","),
                 vm.envAddress("TIMELOCK_ADMIN")
