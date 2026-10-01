@@ -34,7 +34,11 @@ interface VmScript {
 ///   TERMINATOR    the key that can force-cancel a subscription
 ///   IMPORTER      the key allowed to call importAccounts (address(0) to leave imports shut)
 ///   IMPL          an already-deployed Subscription implementation to reuse; omit to deploy one
-///   TIMELOCK      an existing TimelockController to reuse as owner; omit to deploy a new one
+///   OWNER         the address to own the contract. Usually a TimelockController, but the
+///                 contract only requires it to be non-zero -- a plain EOA is legitimate for a
+///                 test deployment, and makes every owner call a single transaction instead of
+///                 schedule() then execute(). Omit to deploy a fresh timelock from the values
+///                 below. TIMELOCK is accepted as an older name for the same thing.
 ///   MIN_DELAY     new timelock only: seconds a queued call must wait (0 is allowed)
 ///   PROPOSERS     new timelock only: comma-separated addresses that may queue calls
 ///   EXECUTORS     new timelock only: comma-separated; the zero address means anyone may execute
@@ -47,11 +51,10 @@ contract Deploy {
         address feeCollector = vm.envAddress("FEE_COLLECTOR");
         address terminator = vm.envAddress("TERMINATOR");
         address importer = vm.envOr("IMPORTER", address(0));
-        address existingTimelock = vm.envOr("TIMELOCK", address(0));
+        address owner_ = vm.envOr("OWNER", vm.envOr("TIMELOCK", address(0)));
 
         vm.startBroadcast();
 
-        address owner_ = existingTimelock;
         if (owner_ == address(0)) {
             owner_ = address(new TimelockController(
                 vm.envUint("MIN_DELAY"),
