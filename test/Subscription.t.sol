@@ -375,4 +375,89 @@ contract SubscriptionTest {
         sub.renew(alice);
         _assert(usdcBefore - MockERC20(USDC).balanceOf(alice) == GO_PRICE, "renewed in USDC");
     }
+
+    // --- leaving while in arrears -------------------------------------------
+
+    /// The point of the change: an account that cannot pay must still be able to stop the
+    /// meter. Previously cancelling settled first, so exactly the users with no funds were the
+    /// ones who could not leave.
+    function test_CancellingNeedsNoMoneyAndWritesTheArrearsOff() public {
+        _sub(alice, GO_MONTH);
+        vm.warp(sub.nextChargeableAt(alice) + 2 * PERIOD);   // three periods owed
+
+        vm.prank(alice);
+        MockERC20(USDT).approve(address(sub), 0);            // and nothing to pay them with
+        uint receiverBefore = _bal(receiver);
+
+        vm.prank(alice);
+        sub.cancelSubscription();
+
+        _assert(sub.isCancelled(alice), "could not cancel while unable to pay");
+        _assert(_bal(receiver) == receiverBefore, "cancelling moved money");
+        _assert(sub.getEffectiveType(alice) == 0, "still entitled after leaving in arrears");
+        _assert(!sub.canRestore(alice), "restorable although the paid period had run out");
+
+        // the debt is gone rather than merely unpaid
+        vm.prank(feeCollector);
+        try sub.renew(alice) { _assert(false, "renewed a cancelled account"); } catch {}
+        vm.prank(alice);
+        try sub.settleDebt() { _assert(false, "settled a cancelled account"); } catch {}
+    }
+
+    function test_WriteOffReportsHowManyPeriodsWereGivenUp() public {
+        _sub(alice, GO_MONTH);
+        vm.warp(sub.nextChargeableAt(alice) + 2 * PERIOD);   // three owed
+
+        vm.recordLogs();
+        vm.prank(alice);
+        sub.cancelSubscription();
+
+        bytes32 sig = keccak256("DebtWrittenOff(address,uint256,uint8,uint256,uint256)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint periods = type(uint).max;
+        for (uint i = 0; i < logs.length; i++) {
+            if (logs[i].topics[0] == sig) {
+                _assert(uint(logs[i].topics[2]) == GO_MONTH, "wrong plan on the write-off");
+                _assert(uint(logs[i].topics[3]) == 1, "wrong pay token on the write-off");
+                (periods, ) = abi.decode(logs[i].data, (uint, uint));
+            }
+        }
+        _assert(periods == 3, "write-off did not report the three periods owed");
+    }
+
+    /// Nothing is owed, so nothing is written off and no event claims otherwise.
+    function test_CancellingWhilePaidUpWritesNothingOff() public {
+        _sub(alice, GO_MONTH);
+        vm.recordLogs();
+        vm.prank(alice);
+        sub.cancelSubscription();
+
+        bytes32 sig = keccak256("DebtWrittenOff(address,uint256,uint8,uint256,uint256)");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        for (uint i = 0; i < logs.length; i++) {
+            _assert(logs[i].topics[0] != sig, "wrote off a debt that did not exist");
+        }
+        _assert(sub.canRestore(alice), "paid-up cancel should still be restorable");
+    }
+
+    /// A written-off debt cannot come back: returning later is a fresh subscription, billed
+    /// one period from now rather than from the anchor it walked away from.
+    function test_ComingBackAfterAWriteOffStartsClean() public {
+        _sub(alice, GO_MONTH);
+        vm.warp(sub.nextChargeableAt(alice) + 2 * PERIOD);
+        vm.prank(alice);
+        MockERC20(USDT).approve(address(sub), 0);
+        vm.prank(alice);
+        sub.cancelSubscription();
+
+        vm.warp(vm.getBlockTimestamp() + 100 days);
+        vm.prank(alice);
+        MockERC20(USDT).approve(address(sub), type(uint).max);
+        uint before = _bal(alice);
+        _sub(alice, GO_MONTH);
+
+        _assert(before - _bal(alice) == GO_PRICE, "the forgiven periods were billed on return");
+        _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "anchor did not restart at now");
+        _assert(!sub.isCancelled(alice), "still flagged cancelled after resubscribing");
+    }
 }

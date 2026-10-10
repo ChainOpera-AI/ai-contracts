@@ -162,6 +162,16 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         address indexed previous_inviter,
         address indexed new_inviter
     );
+    /// @notice Arrears given up when an account cancelled. Not charged, not recoverable.
+    /// Carries periods rather than a price on purpose: pricing COAI reads the TWAP, and a
+    /// revert there would put cancelling back out of reach of the accounts that need it most.
+    event DebtWrittenOff(
+        address indexed account,
+        uint indexed subscriptionType,
+        uint8 indexed payToken,
+        uint periodsWrittenOff,
+        uint writtenOffAt
+    );
     event SubscriptionRestored(
         address indexed account,
         uint indexed subscriptionType,
@@ -521,18 +531,24 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         uint subscriptionType = _activeType[sender];
         if (subscriptionType == 0) revert NotSubscribed();
         if (_cancelled[sender]) revert AlreadyCancelled();
-        // If the caller is in debt, auto-settle so users always exit fully paid up
-        // without needing a separate settleDebt tx first. This is also what guarantees a
-        // cancelled account can never carry debt afterwards: renewals stop from here on.
-        _settleIfDebt(sender, subscriptionType);
-        // A parked downgrade lands inside that settle, so the plan being cancelled may no
-        // longer be the one read on entry. Re-read it, or the event names a plan the account
-        // has already left.
-        subscriptionType = _activeType[sender];
+        // Leaving is unconditional, and arrears are written off rather than charged. Settling
+        // first meant an account that could not pay -- or whose COAI quote happened to be
+        // unavailable -- could not cancel at all, while one that simply never called cancel
+        // kept the service and owed the same amount. The old rule trapped the users who wanted
+        // to leave cleanly without collecting a cent more from the ones who did not.
+        // Nothing is given up that was still collectable: renew and settleDebt both refuse a
+        // cancelled account, so the debt dies the moment this flag goes up either way.
+        uint periodsWrittenOff = _unpaidPeriods(sender, subscriptionType);
         // Cancelling supersedes a parked downgrade: the slot now holds "ends at period end".
+        // The downgrade never lands, so the event names the plan the account actually held.
         delete _pendingType[sender];
         _cancelled[sender] = true;
         emit SubscriptionCancelled(sender, subscriptionType, block.timestamp);
+        if (periodsWrittenOff != 0) {
+            emit DebtWrittenOff(
+                sender, subscriptionType, _activePayToken[sender], periodsWrittenOff, block.timestamp
+            );
+        }
     }
 
     /// @notice Undo a cancellation while the paid-up period is still running. Free — that
@@ -1166,6 +1182,17 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     }
 
     /// @return settled True when arrears existed and have just been charged.
+    /// @dev Periods that have come due and gone unpaid; 0 when the account is paid up.
+    /// Mirrors the count _settle would charge, but reads only -- a caller that is giving the
+    /// debt up must not be able to fail on the way to reporting it.
+    function _unpaidPeriods(address account, uint subscriptionType) private view returns (uint) {
+        uint next = _nextChargeableAt[account][subscriptionType];
+        if (next == 0 || block.timestamp < next) return 0;
+        uint32 period = _lockedPeriod[account];
+        if (period == 0) return 0;
+        return (block.timestamp - next) / period + 1;
+    }
+
     function _settleIfDebt(address account, uint subscriptionType) private returns (bool settled) {
         uint next = _nextChargeableAt[account][subscriptionType];
         if (next == 0) return false; // not subscribed to this type

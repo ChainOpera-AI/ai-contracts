@@ -405,7 +405,7 @@ contract PlanChangeTest {
     /// Cancelling while in arrears runs _settleIfDebt, and a parked downgrade lands inside
     /// that settle — so the plan being cancelled is no longer the one read at entry. The
     /// event must name the plan the account actually ends on.
-    function test_CancelReportsThePlanItActuallyEndsOn() public {
+    function test_CancelInArrearsDiscardsTheParkedDowngrade() public {
         _sub(PRO_MONTH);
         uint next = sub.nextChargeableAt(alice);
         _change(GO_MONTH);                       // parked for period end
@@ -416,8 +416,10 @@ contract PlanChangeTest {
         vm.prank(alice);
         sub.cancelSubscription();
 
-        // the downgrade landed: the account is on GO now
-        _assert(sub.getActiveType(alice) == GO_MONTH, "downgrade landed during the settle");
+        // Nothing is charged on the way out, so the parked downgrade never lands: the account
+        // leaves on the plan it actually held and last paid for.
+        _assert(sub.getActiveType(alice) == PRO_MONTH, "left on the plan it never paid for");
+        _assert(sub.getPendingType(alice) == 0, "parked downgrade survived the cancel");
 
         bytes32 sig = keccak256("SubscriptionCancelled(address,uint256,uint256)");
         Vm.Log[] memory logs = vm.getRecordedLogs();
@@ -426,6 +428,6 @@ contract PlanChangeTest {
             if (logs[i].topics[0] == sig) reported = uint(logs[i].topics[2]);
         }
         _assert(reported != type(uint).max, "no SubscriptionCancelled event");
-        _assert(reported == GO_MONTH, "event named the pre-downgrade plan");
+        _assert(reported == PRO_MONTH, "event named a plan the account never held");
     }
 }

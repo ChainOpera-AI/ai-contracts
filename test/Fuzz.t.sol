@@ -192,14 +192,19 @@ contract FuzzTest {
         vm.prank(feeCollector);
         try sub.renew(alice) { _assert(false, "renewed off a broken oracle"); } catch {}
 
-        // cancelling settles the debt, which also needs the oracle => it reverts too.
+        // Cancelling does not price anything, so a dead oracle cannot strand the subscriber.
+        // It used to settle first, which needed the same quote renew just failed on, and left
+        // the terminator as the only way out of an account nobody could price.
         vm.prank(alice);
-        try sub.cancelSubscription() { _assert(false, "settled off a broken oracle"); } catch {}
+        sub.cancelSubscription();
+        _assert(sub.isCancelled(alice), "could not cancel off a broken oracle");
+        _assert(sub.getEffectiveType(alice) == 0, "still entitled after cancelling in arrears");
 
-        // the terminator is the escape hatch, and it works without any pricing
-        vm.prank(address(0xDEAD));
-        sub.terminateSubscription(alice);
-        _assert(sub.getActiveType(alice) == 0, "terminator could not clear the account");
+        // and the debt went with it: nothing can charge a cancelled account
+        vm.prank(feeCollector);
+        try sub.renew(alice) { _assert(false, "renewed a cancelled account"); } catch {}
+        vm.prank(alice);
+        try sub.settleDebt() { _assert(false, "settled a cancelled account"); } catch {}
     }
 
     /// However many periods are owed, renewing by hand charges exactly that many — never one
