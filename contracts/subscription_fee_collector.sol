@@ -52,6 +52,7 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     error AlreadyListed(uint subscriptionType);
     error InvalidInviter();
     error ImportAlreadyClosed();
+    error PriceOutOfRange(uint price);
     error NotImporter(
         address importer,
         address caller
@@ -326,9 +327,10 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     // account mid-trial right now", which decides whether a plan change is free. Never needs
     // clearing: it simply falls into the past, and a plan change does not move it.
     mapping(address => uint) private _trialEndsAt;
-    // user => inviter (referrer) address. Required (non-zero) on every subscribeXXX call;
-    // each successful subscribe overwrites the stored value, so users can switch their referrer
-    // on a later call. Subscribers cannot invite themselves. Persists across cancel/terminate.
+    // user => inviter (referrer) address. Optional: the zero address is accepted and simply
+    // records "no referrer". The only rule is that an account cannot invite itself. Each
+    // successful subscribe overwrites the stored value, so users can switch their referrer on
+    // a later call. Persists across cancel/terminate.
     mapping(address => address) private _inviters;
     // Set once by closeImport(); after that importAccounts is dead for good.
     bool private _importClosed;
@@ -863,6 +865,9 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         // to stop new sign-ups instead.
         if (subscriptionType == 0) revert InvalidSubscriptionType(0);
         if (price == 0) revert InvalidSubscriptionType(subscriptionType);
+        // _changeDeltaUSD works in int256; a price past that bound would wrap on the cast
+        // and silently invert an upgrade into a downgrade.
+        if (price > uint(type(int256).max)) revert PriceOutOfRange(price);
         _subscriptionPrices[subscriptionType] = price;
         emit SubscriptionPriceChanged(subscriptionType, price);
     }
@@ -1251,6 +1256,10 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
                 delete _nextChargeableAt[account][previous];
                 delete _nextChargeableAt[account][subscriptionType];
                 delete _cancelled[account];
+                // Cancelling clears this, so natively it is already zero. An import can set
+                // both flags at once, and a downgrade parked against the subscription that
+                // just ended must not land on the new one.
+                delete _pendingType[account];
                 if (previous != subscriptionType) {
                     emit SubscriptionSwitched(account, previous, subscriptionType);
                 }
@@ -1285,6 +1294,13 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
             _lockedPeriod[account] = period;
         } else {
             period = _lockedPeriod[account];
+            // Nothing this contract does produces a live anchor with no period behind it.
+            // If one turns up anyway, adopt the plan's period instead of leaving the account
+            // permanently unchargeable -- _requireDue has already refused a plan with none.
+            if (period == 0) {
+                period = _subscriptionPeriods[subscriptionType];
+                _lockedPeriod[account] = period;
+            }
         }
         if (trialStarted) {
             // Free trial: nothing is charged now. Anchoring at the trial's end means the fee
@@ -1482,7 +1498,9 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     /// address the owner has named, and it writes the
     /// same fields a subscribe would, so the imported account behaves exactly like a native one:
     /// renew, settle, cancel, restore and changeSubscription all work off these values.
-    /// @dev Rows with subscriptionType 0 are skipped, so a batch can carry gaps. This does NOT
+    /// @dev Rows with subscriptionType 0 are skipped, so a batch can carry gaps. Every other
+    /// row is checked against the plans actually configured here, so a bad field fails the
+    /// batch rather than producing a quietly unchargeable account. This does NOT
     /// move any money — it only reproduces bookkeeping. Verify the source values first: nothing
     /// here can tell a correct anchor from a wrong one.
     function importAccounts(ImportedAccount[] calldata rows) onlyImporter external {
@@ -1492,6 +1510,30 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
             ImportedAccount calldata r = rows[i];
             if (r.subscriptionType == 0) continue;
             if (r.lockedPeriod == 0) revert UnknownPeriod();
+            // Nothing downstream re-checks these, so a row that is wrong here produces an
+            // account the contract can never charge, settle or change -- and says nothing at
+            // the time. Refusing the batch is the only moment the mistake is still cheap.
+            if (r.payToken != PAY_TOKEN_USDT && r.payToken != PAY_TOKEN_COAI && r.payToken != PAY_TOKEN_USDC) {
+                revert UnknownPayToken(r.payToken);
+            }
+            // The plan has to exist, or _priceOf reverts on the first renewal.
+            if (_subscriptionPrices[r.subscriptionType] == 0) revert InvalidSubscriptionType(r.subscriptionType);
+            if (_subscriptionPeriods[r.subscriptionType] == 0) revert UnknownPeriod();
+            // _requireDue relies on this: a non-zero _activeType always has an anchor.
+            if (r.nextChargeableAt == 0) revert NotSubscribed();
+            if (r.pendingType != 0) {
+                // A parked downgrade is read at the next charge, so its target must exist too.
+                if (_subscriptionPeriods[r.pendingType] == 0) revert InvalidSubscriptionType(r.pendingType);
+                // _pendingType and _cancelled are the same "happens at period end" slot, and
+                // every path in this contract keeps them mutually exclusive.
+                if (r.cancelled) revert PendingChangeExists(r.pendingType);
+            }
+            // Re-importing an account onto a different plan would otherwise leave the old
+            // anchor live, and two anchors is a state no native transition can reach.
+            uint previous = _activeType[r.account];
+            if (previous != 0 && previous != r.subscriptionType) {
+                delete _nextChargeableAt[r.account][previous];
+            }
             _activeType[r.account] = r.subscriptionType;
             _activePayToken[r.account] = r.payToken;
             _lockedPeriod[r.account] = r.lockedPeriod;
