@@ -460,4 +460,19 @@ contract SubscriptionTest {
         _assert(sub.nextChargeableAt(alice) == vm.getBlockTimestamp() + PERIOD, "anchor did not restart at now");
         _assert(!sub.isCancelled(alice), "still flagged cancelled after resubscribing");
     }
+
+    /// _changeDeltaUSD casts the price to int256 to work out whether a change is an upgrade.
+    /// A price past that bound would wrap negative and invert the comparison, so it is refused
+    /// where it is set rather than discovered during someone's plan change.
+    function test_APriceThatWouldWrapTheChangeMathIsRefused() public {
+        uint tooBig = uint(type(int256).max) + 1;
+        vm.prank(timelock);
+        vm.expectRevert(abi.encodeWithSignature("PriceOutOfRange(uint256)", tooBig));
+        sub.setSubscriptionPrice(GO_MONTH, tooBig);
+
+        // the bound itself is still accepted, so nothing ordinary is caught by it
+        vm.prank(timelock);
+        sub.setSubscriptionPrice(GO_MONTH, uint(type(int256).max));
+        _assert(sub.getSubscriptionPrice(GO_MONTH) == uint(type(int256).max), "the bound is allowed");
+    }
 }
