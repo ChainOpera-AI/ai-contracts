@@ -12,12 +12,16 @@ contract Handler {
     Vm constant vm = Vm(0x7109709ECfa91a80626fF3989D68f67F5b1DD12D);
 
     Subscription public sub;
+    bool public cancelWasRefused;        // a subscribed, uncancelled account could not leave
+    bool public cancelSucceededWrongly;  // cancel went through where it had no right to
     address public feeCollector;
+    address public terminator;
+    address public importer;
     address[] public actors;
     address public usdt;
 
-    constructor(Subscription s, address fc, address usdtAddr, address[] memory a) {
-        sub = s; feeCollector = fc; usdt = usdtAddr; actors = a;
+    constructor(Subscription s, address fc, address term, address imp, address usdtAddr, address[] memory a) {
+        sub = s; feeCollector = fc; terminator = term; importer = imp; usdt = usdtAddr; actors = a;
     }
 
     function _actor(uint seed) internal view returns (address) { return actors[seed % actors.length]; }
@@ -40,9 +44,54 @@ contract Handler {
         try sub.changeSubscription(_type(typeSeed)) {} catch {}
     }
 
+    /// Since arrears are written off rather than charged, an account that holds a plan and
+    /// has not already cancelled must ALWAYS be able to leave -- no balance, no allowance and
+    /// no working COAI quote required. Swallowing a revert here would hide exactly that.
     function cancel(uint actorSeed) external {
-        vm.prank(_actor(actorSeed));
-        try sub.cancelSubscription() {} catch {}
+        address a = _actor(actorSeed);
+        bool shouldSucceed = sub.getActiveType(a) != 0 && !sub.isCancelled(a);
+        vm.prank(a);
+        // Recorded rather than required: fail_on_revert is off, so a revert raised here would
+        // only be counted, never surfaced. invariant_CancellingIsAlwaysAvailable reads these.
+        try sub.cancelSubscription() {
+            if (!shouldSucceed) cancelSucceededWrongly = true;
+        } catch {
+            if (shouldSucceed) cancelWasRefused = true;
+        }
+    }
+
+    /// The terminator wipes an account outright, and nothing else in the handler clears
+    /// _activeType, so without this the fuzzer never sees a post-terminate account.
+    function terminate(uint actorSeed) external {
+        vm.prank(terminator);
+        try sub.terminateSubscription(_actor(actorSeed)) {} catch {}
+    }
+
+    /// Imported accounts must behave like natively subscribed ones. Rows are built to pass
+    /// the import checks, so anything the invariants catch here is a real interaction and
+    /// not just bad input -- ImportIntegrity covers the rejections.
+    function importOne(uint actorSeed, uint typeSeed, uint tokenSeed, uint whenSeed, bool cancelled) external {
+        address a = _actor(actorSeed);
+        uint t = _type(typeSeed);
+        uint32 period = sub.getSubscriptionPeriod(t);
+        if (period == 0) return;
+        Subscription.ImportedAccount[] memory rows = new Subscription.ImportedAccount[](1);
+        rows[0] = Subscription.ImportedAccount({
+            account: a,
+            subscriptionType: t,
+            payToken: uint8(tokenSeed % 3) + 1,
+            lockedPeriod: period,
+            // straddle the anchor so both paid-up and in-arrears accounts get imported
+            nextChargeableAt: _anchorAround(uint(period), whenSeed),
+            // the pending slot and the cancelled flag are mutually exclusive
+            pendingType: cancelled ? 0 : (typeSeed % 2 == 0 ? 0 : _type(typeSeed + 1)),
+            trialEndsAt: 0,
+            cancelled: cancelled,
+            everSubscribed: true,
+            inviter: address(0)
+        });
+        vm.prank(importer);
+        try sub.importAccounts(rows) {} catch {}
     }
 
     function restore(uint actorSeed) external {
@@ -76,6 +125,14 @@ contract Handler {
         vm.warp(vm.getBlockTimestamp() + 1 hours + (secondsSeed % 39 days));
     }
 
+    /// An anchor on either side of now, so both paid-up and in-arrears accounts get imported.
+    /// Import refuses 0, and subtracting a yearly period from an early timestamp would underflow.
+    function _anchorAround(uint period, uint seed) internal view returns (uint) {
+        uint base = vm.getBlockTimestamp();
+        uint a = base > period ? base - period + (seed % (2 * period)) : base + 1 + (seed % period);
+        return a == 0 ? 1 : a;
+    }
+
     function actorCount() external view returns (uint) { return actors.length; }
 }
 
@@ -94,6 +151,8 @@ contract InvariantTest {
     Handler handler;
     address receiver = address(0xBEEF);
     address feeCollector = address(0xFEE);
+    address terminator = address(0xDEAD);
+    address importer = address(0x1A4F);
     address[] actors;
 
     function setUp() public {
@@ -106,7 +165,7 @@ contract InvariantTest {
 
         address[] memory roles = new address[](1);
         roles[0] = address(this);
-        sub = deploySubscription(receiver, feeCollector, address(0xDEAD), address(0), 0, roles, roles, address(0));
+        sub = deploySubscription(receiver, feeCollector, terminator, importer, 0, roles, roles, address(0));
 
         for (uint i = 0; i < ACTORS; i++) {
             address a = address(uint160(0xA000 + i));
@@ -119,7 +178,7 @@ contract InvariantTest {
             MockERC20(USDC).approve(address(sub), type(uint).max);
         }
 
-        handler = new Handler(sub, feeCollector, USDT, actors);
+        handler = new Handler(sub, feeCollector, terminator, importer, USDT, actors);
     }
 
     /// Foundry reads this to confine the fuzzer to the handler, instead of letting it call
@@ -131,6 +190,13 @@ contract InvariantTest {
     }
 
     function _assert(bool ok, string memory what) internal pure { require(ok, what); }
+
+    /// Leaving is unconditional: the 2026-10-10 change gives arrears up rather than charging
+    /// them, so no balance, allowance or oracle state can trap a subscriber in a plan.
+    function invariant_CancellingIsAlwaysAvailable() public view {
+        _assert(!handler.cancelWasRefused(), "a subscribed account was refused a cancel");
+        _assert(!handler.cancelSucceededWrongly(), "cancel went through on an account with no plan");
+    }
 
     /// The contract forwards every payment and must never sit on a balance.
     function invariant_ContractNeverHoldsTokens() public view {
