@@ -22,12 +22,8 @@ let an account in arrears cancel, and wrote whatever `importAccounts` was handed
 storage. Storage layout was compared slot by slot against the old one before the upgrade, and the
 deployed code matches a local build byte for byte apart from UUPSUpgradeable's `__self`.
 
-### Test deployment
-
-`0x9Bd03E7B6790990CCD27A0078945D2cB0a3693F6`, owned by the same timelock, with every role on
-`0x561097298c7BD8385Aa1a462b44d894106449fB1`. It runs
-`0x7d414acFabA10acC0027Db0Da9ec4C00F1c9BfE4` — one version behind production, so the two are not
-interchangeable. Check `getImplementation()` before reading anything into a test against it.
+The COAI price pool has since been moved to `0x778121B464151FE5d931587c457E48FcAaA0dc7A`
+(PancakeV3, observation cardinality grown to 8000 so the 30-minute TWAP has enough history).
 
 The timelock is the one that already owned the previous deployment. Its four roles are held
 solely by `0x466B0457…1898`, and `minDelay` is 0 — which still means `schedule()` then
@@ -35,6 +31,42 @@ solely by `0x466B0457…1898`, and `minDelay` is 0 — which still means `schedu
 
 Deployed in two transactions because the deployer is an EIP-7702 delegated account and BSC
 refuses gapped-nonce transactions from those; see `script/Deploy.s.sol` on `--slow`.
+
+### Test deployment
+
+| | |
+|---|---|
+| Subscription proxy | `0x9Bd03E7B6790990CCD27A0078945D2cB0a3693F6` |
+| Implementation | `0x8975B2f36BfB76D2EE2e47Dc85238a5B03249A6b` |
+| TopUp | `0x1A4c39D815c56c5dAce5a2DDe4D3C7815c8618aa` |
+| Owner of both (TimelockController) | `0xcF5d9bD4756cD8cD63cc31B1019E307E667AF3aB` |
+
+The timelock is the test deployment's own: `minDelay` 0 and all four roles on
+`0x561097298c7BD8385Aa1a462b44d894106449fB1`, which is also the receiver, fee collector,
+terminator and importer, so one key drives everything and nothing here can reach production.
+Prices and periods are set for debugging, not to match production (GO_MONTH costs 499 units
+on a 60-second period), and are meant to stay that way.
+
+Upgraded 2026-11-19 from `0x9bC2A45c1816385036dD7C212742fb3d106139dE` — the implementation
+production still runs — to the version where `renew` and `renewBatch` take any caller while
+`_feeCollector` is the zero address, and `setFeeCollector(0)` is allowed to switch that on. The
+test contract is therefore one version **ahead** of production now; check `getImplementation()`
+before carrying a result across. The upgrade changed no state: the fee collector is still
+`0x5610…fB1`, so the open path stays off until the timelock sets it to zero. Done with
+`script/upgrade.sh`; the landed code matched the local build byte for byte apart from
+UUPSUpgradeable's `__self`.
+
+### Upgrading
+
+```
+PROXY=<proxy> TIMELOCK=<its owner> ACCOUNT=<cast keystore> script/upgrade.sh
+```
+
+deploys the implementation from the checkout, checks the runtime code that landed against the
+local build, then schedules and executes `upgradeTo` through the timelock and reads the proxy
+back. Nothing is sent until the proxy's owner and the signer's roles have been confirmed. `IMPL`
+skips the deploy, which is how production runs it: the deployer puts the implementation up,
+the timelock's proposer (`0x466B…1898`) runs the rest.
 
 ### Superseded
 
