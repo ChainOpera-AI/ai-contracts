@@ -475,4 +475,61 @@ contract SubscriptionTest {
         sub.setSubscriptionPrice(GO_MONTH, uint(type(int256).max));
         _assert(sub.getSubscriptionPrice(GO_MONTH) == uint(type(int256).max), "the bound is allowed");
     }
+
+    // --- an open collector ---------------------------------------------------
+
+    /// With no collector named, anyone may trigger a renewal. Nothing about the charge is up to
+    /// the caller -- amount, payer and payee all come from contract state -- so opening it only
+    /// removes the dependency on one key and one cron.
+    function test_RenewIsOpenToAnyoneWhenNoCollectorIsNamed() public {
+        _sub(alice, GO_MONTH);
+        vm.warp(sub.nextChargeableAt(alice));
+        address stranger = address(0xBAD);
+
+        // closed while a collector is named
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSignature("NotFeeCollector(address,address)", feeCollector, stranger));
+        sub.renew(alice);
+
+        vm.prank(timelock);
+        sub.setFeeCollector(address(0));
+        _assert(sub.getFeeCollector() == address(0), "collector cleared");
+
+        uint before = _bal(receiver);
+        vm.prank(stranger);
+        sub.renew(alice);
+        _assert(_bal(receiver) - before == GO_PRICE, "a stranger triggered exactly one period's charge");
+
+        // the batch entry follows the same gate
+        vm.warp(sub.nextChargeableAt(alice));
+        address[] memory accounts = new address[](1);
+        accounts[0] = alice;
+        before = _bal(receiver);
+        vm.prank(stranger);
+        sub.renewBatch(accounts);
+        _assert(_bal(receiver) - before == GO_PRICE, "renewBatch is open as well");
+    }
+
+    /// Naming a collector again closes the door.
+    function test_NamingACollectorClosesRenewAgain() public {
+        _sub(alice, GO_MONTH);
+        vm.prank(timelock);
+        sub.setFeeCollector(address(0));
+        vm.prank(timelock);
+        sub.setFeeCollector(feeCollector);
+
+        vm.warp(sub.nextChargeableAt(alice));
+        address stranger = address(0xBAD);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSignature("NotFeeCollector(address,address)", feeCollector, stranger));
+        sub.renew(alice);
+    }
+
+    /// A fresh deployment may start open, the same way it may start with a collector named.
+    function test_DeploymentAcceptsAnOpenCollector() public {
+        address[] memory roles = new address[](1);
+        roles[0] = address(this);
+        Subscription open = deploySubscription(receiver, address(0), terminator, address(0), 0, roles, roles, address(0));
+        _assert(open.getFeeCollector() == address(0), "deployed with renewals open");
+    }
 }

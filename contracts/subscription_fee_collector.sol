@@ -279,6 +279,8 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     mapping(uint => uint) private _subscriptionPrices;
     // payToken => discount numerator, denominator = DISCOUNT_BASE. e.g. 700 / 1000 = 30% off
     mapping(uint8 => uint) private _discounts;
+    // The only address allowed to call renew / renewBatch. Zero opens both to anyone -- see
+    // onlyFeeCollector for why that is safe.
     address private _feeCollector;
     // Privileged role that can force-cancel any subscription, ignoring debt. Intended as an
     // escape hatch for accounts that have become unable to pay and would otherwise accrue
@@ -404,7 +406,8 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
     ) public initializer {
         __ReentrancyGuard_init();
         __UUPSUpgradeable_init();
-        if (receiver == address(0) || feeCollector == address(0) || subscriptionTerminator == address(0)) revert ZeroAddress();
+        // feeCollector is allowed to be zero: that deploys with renewals open to anyone.
+        if (receiver == address(0) || subscriptionTerminator == address(0)) revert ZeroAddress();
         if (receiver == address(this)) revert InvalidReceiver();
         if (owner_ == address(0)) revert ZeroAddress();
         _feeCollector = feeCollector;
@@ -690,8 +693,8 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         return _feeCollector;
     }
 
+    /// @notice Name the collector, or pass address(0) to open renew and renewBatch to anyone.
     function setFeeCollector(address new_feeCollector) onlyOwner external {
-        if (new_feeCollector == address(0)) revert ZeroAddress();
         _feeCollector = new_feeCollector;
         emit FeeCollectorChanged(new_feeCollector);
     }
@@ -1024,8 +1027,16 @@ contract Subscription is Initializable, ReentrancyGuardUpgradeable, UUPSUpgradea
         _;
     }
 
+    /// @dev Open when no collector is named. With _feeCollector at zero anyone may trigger a
+    /// renewal, which is safe because the caller decides nothing: what is charged comes from
+    /// the anchor, who pays is the account, who receives is _receiver, and the allowance is
+    /// the account's own. Opening it removes the dependency on one key and one cron -- any
+    /// backend address or a keeper network can collect. The one thing it changes for a
+    /// subscriber: an account in arrears can be charged by a third party before it cancels,
+    /// where a named collector might not have got round to it.
     modifier onlyFeeCollector() {
-        if (msg.sender != _feeCollector) revert NotFeeCollector(_feeCollector, msg.sender);
+        address collector = _feeCollector;
+        if (collector != address(0) && msg.sender != collector) revert NotFeeCollector(collector, msg.sender);
         _;
     }
 
