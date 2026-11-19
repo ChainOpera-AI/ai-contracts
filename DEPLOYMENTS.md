@@ -51,10 +51,11 @@ Upgraded 2026-11-19 from `0x9bC2A45c1816385036dD7C212742fb3d106139dE` — the im
 production still runs — to the version where `renew` and `renewBatch` take any caller while
 `_feeCollector` is the zero address, and `setFeeCollector(0)` is allowed to switch that on. The
 test contract is therefore one version **ahead** of production now; check `getImplementation()`
-before carrying a result across. The upgrade changed no state: the fee collector is still
-`0x5610…fB1`, so the open path stays off until the timelock sets it to zero. Done with
-`script/upgrade.sh`; the landed code matched the local build byte for byte apart from
-UUPSUpgradeable's `__self`.
+before carrying a result across. The upgrade itself changed no state; the timelock then set the
+fee collector to the zero address (block 134437104), so on the test contract anyone may now
+call `renew` and `renewBatch` — checked with an `eth_call` from an unrelated address against
+the one account in arrears. Done with `script/upgrade.sh`; the landed code matched the local
+build byte for byte apart from UUPSUpgradeable's `__self`.
 
 ### Upgrading
 
