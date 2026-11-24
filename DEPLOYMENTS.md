@@ -75,7 +75,15 @@ deploys the implementation from the checkout, checks the runtime code that lande
 local build, then schedules and executes `upgradeTo` through the timelock and reads the proxy
 back. Nothing is sent until the proxy's owner and the signer's roles have been confirmed. `IMPL`
 skips the deploy, which is how production runs it: the deployer puts the implementation up,
-the timelock's proposer (`0x466B…1898`) runs the rest.
+the timelock's proposer (`0x466B…1898`) runs the rest. `CONTRACT=contracts/to_subscription.sol:TOSubscription`
+points it at a TOSubscription proxy instead.
+
+### TOSubscription (TeamilyOpera) — not deployed yet
+
+`contracts/to_subscription.sol`: the same billing kernel with no plan table; the subscriber
+brings the terms and the contract bills by them. Deploy with `script/DeployTO.s.sol` and
+`script/bsc-to-test.env` (every role on the deployer, its own zero-delay timelock) or
+`script/bsc-to-mainnet.env` (fill in first). Record the addresses here once it is up.
 
 ### Superseded
 
