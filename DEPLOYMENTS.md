@@ -78,12 +78,28 @@ skips the deploy, which is how production runs it: the deployer puts the impleme
 the timelock's proposer (`0x466B…1898`) runs the rest. `CONTRACT=contracts/to_subscription.sol:TOSubscription`
 points it at a TOSubscription proxy instead.
 
-### TOSubscription (TeamilyOpera) — not deployed yet
+### TOSubscription (TeamilyOpera) — test deployment 2026-11-24
+
+| | |
+|---|---|
+| Proxy (use this one) | [`0x0911F9D1F5F61b67C798352aD938308b90FF25c3`](https://bscscan.com/address/0x0911F9D1F5F61b67C798352aD938308b90FF25c3) |
+| Implementation | `0x91a33924eAabdBbeA2d6C88E5f2D3aB7fF7b0E31` |
+| Owner (TimelockController) | `0x93a60e3cC1fA76F7C2E17d078925328FE6655A3D`, `minDelay` 0 |
+| Receiver, terminator, every timelock role | `0x561097298c7BD8385Aa1a462b44d894106449fB1` |
+| Fee collector | zero address: `renew` / `renewBatch` open to anyone |
 
 `contracts/to_subscription.sol`: the same billing kernel with no plan table; the subscriber
-brings the terms and the contract bills by them. Deploy with `script/DeployTO.s.sol` and
-`script/bsc-to-test.env` (every role on the deployer, its own zero-delay timelock) or
-`script/bsc-to-mainnet.env` (fill in first). Record the addresses here once it is up.
+brings the terms (a USD amount, a period, a trial length, an opaque plan reference) and the
+contract bills by them. Deployed with `script/DeployTO.s.sol` and `script/bsc-to-test.env` in
+three transactions (timelock, implementation, proxy; 6,717,074 gas). Checked on chain: the
+implementation matches the local build byte for byte apart from UUPSUpgradeable's `__self`,
+its initializer is locked, the timelock is byte-identical to the local OpenZeppelin build,
+and the defaults hold (period bounds 1–366 days, trial cap 30 days, COAI at 900/1000, the
+deep COAI pool, TWAP healthy). Period bounds can be widened for debugging through the
+timelock: `setPeriodBounds(60, 31622400)`.
+
+Production is not deployed: fill in `script/bsc-to-mainnet.env` (receiver, terminator, a
+timelock of TeamilyOpera's own) and run the same script.
 
 ### Superseded
 
