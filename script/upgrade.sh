@@ -19,6 +19,8 @@
 #   RPC       optional, default bsc (the alias in foundry.toml)
 #   SALT      optional timelock salt; default derives from the implementation address
 #   FROM      anvil only: sign as this address with --unlocked instead of a keystore
+#   CONTRACT  optional, default contracts/subscription_fee_collector.sol:Subscription; the
+#             TO contract is contracts/to_subscription.sol:TOSubscription
 #
 # Transactions go out one at a time, so an EIP-7702 delegated signer is fine here.
 set -euo pipefail
@@ -27,7 +29,9 @@ cd "$(dirname "$0")/.."
 : "${PROXY:?set PROXY}" "${TIMELOCK:?set TIMELOCK}"
 RPC=${RPC:-bsc}
 ZERO=0x0000000000000000000000000000000000000000000000000000000000000000
-ART=out/subscription_fee_collector.sol/Subscription.json
+CONTRACT=${CONTRACT:-contracts/subscription_fee_collector.sol:Subscription}
+NAME=${CONTRACT##*:}
+ART=out/$(basename "${CONTRACT%%:*}")/$NAME.json
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -79,11 +83,11 @@ echo "timelock    $TIMELOCK  (minDelay $DELAY)"
 step "build"
 quietly forge build
 LOCAL_SIZE=$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["deployedBytecode"]["object"][2:])//2)' "$ART")
-echo "Subscription runtime $LOCAL_SIZE bytes"
+echo "$NAME runtime $LOCAL_SIZE bytes"
 
 if [[ -z "${IMPL:-}" ]]; then
     step "deploy the implementation"
-    quietly forge create contracts/subscription_fee_collector.sol:Subscription --rpc-url "$RPC" "${SIGN[@]}" --broadcast --json
+    quietly forge create "$CONTRACT" --rpc-url "$RPC" "${SIGN[@]}" --broadcast --json
     IMPL=$(python3 -c '
 import json, sys
 s = open(sys.argv[1]).read()
